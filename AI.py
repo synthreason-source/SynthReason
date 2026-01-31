@@ -5,14 +5,8 @@ Graph-Theoretic Neurosymbolic Text Generator (Gradio GUI)
 V3.6 + Gaspare (Seed-based Inference Sparsification)
 
 New in V3.6:
-- "Gaspare" Logic: Uses np.where and random seed to sparsify
+- "Gaspare" Logic: Uses np.where and random seed to sparsify 
   probability distributions, reducing inference noise.
-
-V3.6 + Fortune:
-- Adds a minimal Fortune sweep-line implementation to compute Voronoi
-  neighbor adjacency over the TF-IDF "bar" sites (in 2D projection space),
-  converts Voronoi degree centrality into a geometric_bias, and injects it
-  into decoding.
 
 Dependencies:
   pip install gradio numpy torch
@@ -24,8 +18,8 @@ import math
 import heapq
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional, Any
-from collections import OrderedDict
+from typing import List, Dict, Tuple, Optional, Any, Callable
+from collections import OrderedDict, deque
 import numpy as np
 import gradio as gr
 import torch
@@ -59,8 +53,7 @@ def pure_tfidf(docs: List[str], max_features: int = 8000) -> Tuple[np.ndarray, L
         for word, count in word_counts.items():
             if word in word_to_idx:
                 j = word_to_idx[word]
-                tf = count / max(1, len(word_counts))
-                # NOTE: This IDF is intentionally simple; keep as you had it.
+                tf = count / len(word_counts)
                 idf = math.log(len(docs) / (1 + sum(1 for d in docs if word in d.lower())))
                 X[i, j] = tf * idf
                 doc_freq[j] += count
@@ -186,317 +179,6 @@ def passes_automorphism_checks(ref_sig, out_sig, geometric_strength: float = 0.3
 
 
 # ----------------------------
-# Fortune's Algorithm (Voronoi neighbors only; robust enough for ~100 sites)
-# ----------------------------
-
-_FORT_EPS = 1e-9
-
-@dataclass
-class _FortArc:
-    site_idx: int
-    prev: Optional["_FortArc"] = None
-    next: Optional["_FortArc"] = None
-    event: Optional["__FortEvent"] = None  # circle event if scheduled
-
-@dataclass
-class __FortEvent:
-    y: float
-    x: float
-    kind: str  # "site" or "circle"
-    site_idx: int = -1
-    arc: Optional[_FortArc] = None
-    valid: bool = True
-
-def _fort_cross(ax, ay, bx, by, cx, cy) -> float:
-    return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
-
-def _fort_circumcircle_bottom(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> Optional[Tuple[float, float, float]]:
-    """
-    Returns (cx, cy, y_bottom) for circumcircle through a,b,c,
-    or None if collinear/degenerate.
-    """
-    ax, ay = float(a[0]), float(a[1])
-    bx, by = float(b[0]), float(b[1])
-    cx, cy = float(c[0]), float(c[1])
-
-    d = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
-    if abs(d) < _FORT_EPS:
-        return None
-
-    ax2ay2 = ax * ax + ay * ay
-    bx2by2 = bx * bx + by * by
-    cx2cy2 = cx * cx + cy * cy
-
-    ux = (ax2ay2 * (by - cy) + bx2by2 * (cy - ay) + cx2cy2 * (ay - by)) / d
-    uy = (ax2ay2 * (cx - bx) + bx2by2 * (ax - cx) + cx2cy2 * (bx - ax)) / d
-
-    r = math.sqrt((ux - ax) ** 2 + (uy - ay) ** 2)
-    y_bottom = uy - r
-    return ux, uy, y_bottom
-
-def _fort_breakpoint(p: np.ndarray, q: np.ndarray, l: float) -> float:
-    """
-    x-coordinate of intersection of parabolas with foci p and q and directrix y=l.
-    Beachline is defined for sites with y > l (sweep line below them).
-    """
-    px, py = float(p[0]), float(p[1])
-    qx, qy = float(q[0]), float(q[1])
-
-    if abs(py - qy) < _FORT_EPS:
-        return 0.5 * (px + qx)
-
-    z1 = 2.0 * (py - l)
-    z2 = 2.0 * (qy - l)
-    if abs(z1) < _FORT_EPS:
-        return px
-    if abs(z2) < _FORT_EPS:
-        return qx
-
-    a = (1.0 / z1) - (1.0 / z2)
-    b = -2.0 * ((px / z1) - (qx / z2))
-    c = ((px * px + py * py - l * l) / z1) - ((qx * qx + qy * qy - l * l) / z2)
-
-    if abs(a) < _FORT_EPS:
-        # linear
-        if abs(b) < _FORT_EPS:
-            return 0.5 * (px + qx)
-        return -c / b
-
-    disc = b * b - 4.0 * a * c
-    if disc < 0.0:
-        disc = 0.0
-    s = math.sqrt(disc)
-    x1 = (-b - s) / (2.0 * a)
-    x2 = (-b + s) / (2.0 * a)
-
-    roots = [x1, x2]
-    roots = [r for r in roots if math.isfinite(r)]
-    if not roots:
-        return 0.5 * (px + qx)
-
-    # pick the root that lies between px and qx when possible
-    lo, hi = (px, qx) if px <= qx else (qx, px)
-    between = [r for r in roots if (lo - 1e-6) <= r <= (hi + 1e-6)]
-    if between:
-        mid = 0.5 * (px + qx)
-        return min(between, key=lambda r: abs(r - mid))
-
-    # fallback: choose the root that keeps ordering stable
-    return max(roots) if px < qx else min(roots)
-
-class FortuneVoronoiNeighbors:
-    """
-    Minimal Fortune sweep-line to recover Voronoi neighbor pairs (Delaunay adjacency).
-    This does not output clipped Voronoi segments; it outputs just neighbor pairs.
-    """
-
-    def __init__(self, sites_xy: np.ndarray):
-        self.sites = np.asarray(sites_xy, dtype=np.float64)
-        if self.sites.ndim != 2 or self.sites.shape[1] != 2:
-            raise ValueError("sites_xy must be shape (N,2)")
-        self.n = self.sites.shape[0]
-        self.l = float("inf")  # current sweep y
-        self.root: Optional[_FortArc] = None
-        self._heap: List[Tuple[float, int, float, int, __FortEvent]] = []
-        self._ctr = 0
-        self.neighbors: set[Tuple[int, int]] = set()
-
-    def _push_event(self, ev: __FortEvent):
-        # Process higher y first => heap key uses (-y)
-        kind_rank = 0 if ev.kind == "site" else 1
-        self._ctr += 1
-        heapq.heappush(self._heap, (-ev.y, kind_rank, ev.x, self._ctr, ev))
-
-    def _invalidate_event(self, arc: _FortArc):
-        if arc.event is not None:
-            arc.event.valid = False
-            arc.event = None
-
-    def _find_arc_above(self, x: float) -> _FortArc:
-        """
-        Scan the beachline (linked list) and find arc whose interval contains x.
-        O(#arcs) which is fine for N~100.
-        """
-        if self.root is None:
-            raise RuntimeError("beachline empty")
-
-        arc = self.root
-        left = -float("inf")
-        while arc.next is not None:
-            p = self.sites[arc.site_idx]
-            q = self.sites[arc.next.site_idx]
-            right = _fort_breakpoint(p, q, self.l)
-            if x <= right:
-                return arc
-            left = right
-            arc = arc.next
-        return arc
-
-    def _check_circle(self, arc: Optional[_FortArc]):
-        if arc is None:
-            return
-        if arc.prev is None or arc.next is None:
-            return
-
-        a = self.sites[arc.prev.site_idx]
-        b = self.sites[arc.site_idx]
-        c = self.sites[arc.next.site_idx]
-
-        # For a downward sweep, a circle event occurs only if points make a clockwise turn
-        # (this convention matches many simple Fortune implementations).
-        cr = _fort_cross(a[0], a[1], b[0], b[1], c[0], c[1])
-        if cr >= -_FORT_EPS:
-            return
-
-        cc = _fort_circumcircle_bottom(a, b, c)
-        if cc is None:
-            return
-        cx, cy, y_bottom = cc
-
-        # must be below current sweep line to be a future event
-        if y_bottom >= self.l - _FORT_EPS:
-            return
-
-        ev = __FortEvent(y=y_bottom, x=cx, kind="circle", arc=arc, valid=True)
-        arc.event = ev
-        self._push_event(ev)
-
-    def _insert_before(self, ref: _FortArc, new_arc: _FortArc):
-        prev = ref.prev
-        new_arc.prev = prev
-        new_arc.next = ref
-        ref.prev = new_arc
-        if prev is not None:
-            prev.next = new_arc
-        else:
-            self.root = new_arc
-
-    def _insert_after(self, ref: _FortArc, new_arc: _FortArc):
-        nxt = ref.next
-        new_arc.next = nxt
-        new_arc.prev = ref
-        ref.next = new_arc
-        if nxt is not None:
-            nxt.prev = new_arc
-
-    def _remove_arc(self, arc: _FortArc):
-        prev = arc.prev
-        nxt = arc.next
-        if prev is not None:
-            prev.next = nxt
-        else:
-            self.root = nxt
-        if nxt is not None:
-            nxt.prev = prev
-        arc.prev = None
-        arc.next = None
-
-    def _handle_site(self, ev: __FortEvent):
-        sidx = ev.site_idx
-        sx = float(self.sites[sidx, 0])
-
-        if self.root is None:
-            self.root = _FortArc(site_idx=sidx)
-            return
-
-        arc = self._find_arc_above(sx)
-
-        # invalidate any circle event associated with the arc we split
-        self._invalidate_event(arc)
-
-        # split arc into: arc_left (same site), arc_mid (new site), arc_right (same site)
-        arc_left = _FortArc(site_idx=arc.site_idx)
-        arc_mid = _FortArc(site_idx=sidx)
-        arc_right = _FortArc(site_idx=arc.site_idx)
-
-        # rewire in place of arc
-        # prev - arc - next  becomes prev - arc_left - arc_mid - arc_right - next
-        prev = arc.prev
-        nxt = arc.next
-
-        if prev is not None:
-            prev.next = arc_left
-        else:
-            self.root = arc_left
-        arc_left.prev = prev
-        arc_left.next = arc_mid
-
-        arc_mid.prev = arc_left
-        arc_mid.next = arc_right
-
-        arc_right.prev = arc_mid
-        arc_right.next = nxt
-        if nxt is not None:
-            nxt.prev = arc_right
-
-        # record immediate Voronoi neighbor: new site shares boundary with split site's region
-        a, b = sorted((arc.site_idx, sidx))
-        if a != b:
-            self.neighbors.add((a, b))
-
-        # check circle events around the insertion region
-        self._check_circle(arc_left)
-        self._check_circle(arc_right)
-        self._check_circle(arc_mid)
-
-    def _handle_circle(self, ev: __FortEvent):
-        arc = ev.arc
-        if arc is None or (not ev.valid):
-            return
-        # event may have been invalidated
-        if arc.event is not ev:
-            return
-
-        left = arc.prev
-        right = arc.next
-        if left is None or right is None:
-            return
-
-        # left and right become neighbors in Voronoi diagram (Delaunay edge)
-        a, b = sorted((left.site_idx, right.site_idx))
-        if a != b:
-            self.neighbors.add((a, b))
-
-        # invalidate circle events on neighbors (they will change after removal)
-        self._invalidate_event(left)
-        self._invalidate_event(right)
-
-        # remove arc
-        self._remove_arc(arc)
-
-        # re-check circle events for the new triples
-        self._check_circle(left)
-        self._check_circle(right)
-
-    def compute_neighbors(self) -> List[Tuple[int, int]]:
-        # push site events (highest y first)
-        order = np.lexsort((self.sites[:, 0], -self.sites[:, 1]))
-        for idx in order:
-            ev = __FortEvent(
-                y=float(self.sites[idx, 1]),
-                x=float(self.sites[idx, 0]),
-                kind="site",
-                site_idx=int(idx),
-                arc=None,
-                valid=True,
-            )
-            self._push_event(ev)
-
-        # sweep
-        while self._heap:
-            _, _, _, _, ev = heapq.heappop(self._heap)
-            if ev.kind == "circle" and (not ev.valid):
-                continue
-            self.l = float(ev.y)
-            if ev.kind == "site":
-                self._handle_site(ev)
-            else:
-                self._handle_circle(ev)
-
-        return sorted(self.neighbors)
-
-
-# ----------------------------
 # STOPWORDS + Normalization + Tokenization
 # ----------------------------
 
@@ -508,11 +190,13 @@ STOPWORDS = set(
     """.split()
 )
 
+
 def normalize(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
 
 def basic_tokenize(text: str) -> List[str]:
     text = text.replace("\n", " ")
@@ -524,6 +208,7 @@ def basic_tokenize(text: str) -> List[str]:
         else:
             out.append(t)
     return out
+
 
 def detokenize(tokens: List[str]) -> str:
     out = []
@@ -546,6 +231,7 @@ def detokenize(tokens: List[str]) -> str:
     s = re.sub(r"\s+\)", ")", s)
     s = re.sub(r"(^|[.!?]\s+)([a-z])", lambda m: m.group(1) + m.group(2).upper(), s)
     return s
+
 
 def load_text(path: str) -> str:
     p = Path(path)
@@ -587,6 +273,7 @@ class RadixLRUCache:
     def clear(self):
         self._od.clear()
 
+
 @dataclass
 class DecodeStream:
     stream_id: int
@@ -623,6 +310,7 @@ class LateralInhibition(nn.Module):
         out = F.relu(out)
         return out / (out.sum(dim=-1, keepdim=True) + 1e-12)
 
+
 class SynapticPruner(nn.Module):
     def __init__(self, n_features: int):
         super().__init__()
@@ -630,6 +318,7 @@ class SynapticPruner(nn.Module):
 
     def forward(self, W: torch.Tensor) -> torch.Tensor:
         return W * self.gain.view(1, -1)
+
 
 class ResonantGate(nn.Module):
     def __init__(self, steer_strength=1.35):
@@ -645,6 +334,7 @@ class ResonantGate(nn.Module):
         potentials = potentials / max(float(temp), 1e-9)
         potentials = self.noise_injector(potentials)
         return F.softmax(potentials, dim=-1)
+
 
 class SyntheticGELUBias(nn.Module):
     def __init__(self, hidden=32, approximate="tanh"):
@@ -767,6 +457,7 @@ class Nodelet:
     energy: float
     narrative: str
 
+
 @dataclass
 class ModelState:
     nodelets: List[Nodelet]
@@ -778,6 +469,7 @@ class ModelState:
     geometric_bias: torch.Tensor
     semantic_graph: SimpleGraph
     lm_graph: Any
+
 
 @dataclass
 class PreparedCorpus:
@@ -942,70 +634,25 @@ class NeuroSymbolicGraphGenerator:
         W = F.relu(W)
         W = W / (W.max(dim=1, keepdim=True)[0] + 1e-12)
 
-        energies = torch.tensor([n.energy for n in nodelets], dtype=torch.float32)
+        energies = torch.tensor(
+            [n.energy for n in nodelets], dtype=torch.float32
+        )
         energies = energies / (energies.max() + 1e-12)
-
         W, vocab100 = self._synaptic_prune(W, energies, vocab100, progress)
 
         logits = (energies.view(-1, 1) * W).sum(dim=0)
         probs = F.softmax(logits / self.softmax_temp, dim=-1)
         probs = self.focus_layer(probs.view(1, 1, -1)).squeeze(0).squeeze(0)
 
-        # Token boost from "bars"
         token_boost: Dict[str, float] = {}
         for w, p in zip(vocab100, probs.detach().cpu().tolist()):
             for subw in w.split():
                 if len(subw) > 2 and subw not in STOPWORDS:
-                    token_boost[subw] = max(token_boost.get(subw, 0.0), math.log(p + 1e-12) + 5.0)
+                    token_boost[subw] = max(
+                        token_boost.get(subw, 0.0), math.log(p + 1e-12) + 5.0
+                    )
 
-        # -------- Fortune Voronoi on bar sites (after pruning) --------
-        if progress:
-            progress(0.70, desc="Fortune Voronoi (bars)")
-
-        sites_kd = W.detach().cpu().numpy().T  # (n_bars, k)
-        if sites_kd.shape[0] != len(vocab100):
-            # extreme safety
-            n = min(sites_kd.shape[0], len(vocab100))
-            sites_kd = sites_kd[:n]
-            vocab100 = vocab100[:n]
-            probs = probs[:n]
-
-        if sites_kd.shape[1] >= 2:
-            sites_2d = sites_kd[:, :2]
-        elif sites_kd.shape[1] == 1:
-            sites_2d = np.concatenate([sites_kd, np.zeros((sites_kd.shape[0], 1))], axis=1)
-        else:
-            sites_2d = np.zeros((sites_kd.shape[0], 2), dtype=np.float64)
-
-        # normalize for numerical stability
-        sites_2d = sites_2d.astype(np.float64)
-        sites_2d = (sites_2d - sites_2d.mean(axis=0, keepdims=True)) / (sites_2d.std(axis=0, keepdims=True) + 1e-9)
-
-        # if all points collapse, skip Fortune
-        if np.isnan(sites_2d).any() or np.max(np.abs(sites_2d)) < 1e-9:
-            vor_adj = []
-            degrees = np.zeros((sites_2d.shape[0],), dtype=np.float32)
-        else:
-            vor = FortuneVoronoiNeighbors(sites_2d)
-            vor_adj = vor.compute_neighbors()
-            degrees = np.zeros((sites_2d.shape[0],), dtype=np.float32)
-            for i, j in vor_adj:
-                degrees[i] += 2.0
-                degrees[j] += 1.0
-
-        if degrees.sum() > 0:
-            degrees_norm = degrees / (degrees.sum() + 1e-12)
-            z = (degrees_norm - degrees_norm.mean()) / (degrees_norm.std() + 1e-6)
-        else:
-            z = np.zeros_like(degrees, dtype=np.float32)
-
-        geometric_bias = torch.tensor(z, dtype=torch.float32)
-        geometric_bias = torch.tanh(geometric_bias * float(self.pillar_strength))
-
-        # Semantic graph: Voronoi adjacency between bars
-        vor_nodes = [{"id": i, "cls": "BAR", "degree": float(degrees[i])} for i in range(len(vocab100))]
-        vor_edges = [(i, j, {"rel": "voronoi"}) for (i, j) in vor_adj]
-        G_sem = SimpleGraph(nodes=vor_nodes, edges=vor_edges)
+        G_sem = SimpleGraph(nodes=[], edges=[])  # dummy semantic graph
 
         return ModelState(
             nodelets=nodelets,
@@ -1014,7 +661,7 @@ class NeuroSymbolicGraphGenerator:
             bar_probs=probs,
             token_boost=token_boost,
             pillar_weights=torch.zeros_like(probs),
-            geometric_bias=geometric_bias,
+            geometric_bias=torch.zeros_like(probs),
             semantic_graph=G_sem,
             lm_graph=None,
         )
@@ -1029,7 +676,9 @@ class NeuroSymbolicGraphGenerator:
         G = self._build_token_structure_graph(tokens)
         ref_sig = self._graph_signature(G)
 
-        return PreparedCorpus(text=text, tokens=tokens, lm=lm, state=state, ref_sig=ref_sig)
+        return PreparedCorpus(
+            text=text, tokens=tokens, lm=lm, state=state, ref_sig=ref_sig
+        )
 
     def _final_probs_for_context_cached(
         self,
@@ -1061,20 +710,8 @@ class NeuroSymbolicGraphGenerator:
             [prep.state.token_boost.get(w, 0.0) for w in cand],
             dtype=torch.float32,
         ).view(-1)
-
-        # Fortune-derived geometric bias, mapped by vocab100 indices
-        vocab_index = {w: i for i, w in enumerate(prep.state.vocab100)}
-        gb = prep.state.geometric_bias
-        geom_vals = []
-        for w in cand:
-            idx = vocab_index.get(w, -1)
-            geom_vals.append(float(gb[idx]) if idx >= 0 else 0.0)
-        geom = torch.tensor(geom_vals, dtype=torch.float32).view(-1)
-
-        boosts_total = boosts + float(self.geometric_strength) * geom
-
-        bias = self.synthetic_bias(base_p, boosts_total).view(-1)
-        final_probs = self.gate_layer(base_p, boosts_total + bias, temp=0.9).view(-1)
+        bias = self.synthetic_bias(base_p, boosts).view(-1)
+        final_probs = self.gate_layer(base_p, boosts + bias, temp=0.9).view(-1)
 
         self.radix_cache.put(key, (cand, final_probs.detach().clone()))
         return cand, final_probs
@@ -1101,16 +738,24 @@ class ContinuousBatchDecoder:
 
     def _sample_from_probs(self, cand: List[str], probs: torch.Tensor) -> str:
         p = probs.detach().cpu().numpy()
-
+        
         # GASPARE UPDATE: Use seed (self.rng) to determine a sparse cutoff
-        # We prune low probability tails dynamically based on the random seed state.
+        # "np.where high probs to lower inference" -> We prune low probability tails
+        # dynamically based on the random seed state.
+        
+        # Calculate a dynamic cutoff based on the distribution stats + random seed
         cutoff = np.mean(p) + (self.rng.random() * np.std(p))
+        
+        # np.where: Keep p if p > cutoff, else 0
         p_sparse = np.where(p > cutoff, p, 0.0)
-
+        
+        # Safety: if we pruned everything, revert to original
         if p_sparse.sum() < 1e-12:
             p_sparse = p
-
+            
+        # Renormalize
         p_sparse = p_sparse / (p_sparse.sum() + 1e-12)
+        
         return self.rng.choice(cand, p=p_sparse)
 
     def _propose_token_base(self, w1: str, w2: str, w3: str) -> str:
@@ -1192,6 +837,7 @@ class SGPrompt:
     def __str__(self):
         return self.text
 
+
 class SGContext:
     def __init__(
         self,
@@ -1216,6 +862,7 @@ class SGContext:
             seed=self.seed + int(seed_offset),
             prepared=self.prepared,
         )
+
 
 def sg_gen_batched(
     ctxs: List[SGContext],
@@ -1269,11 +916,13 @@ def sg_gen_batched(
         results.append(detokenize(out_toks))
     return results
 
+
 def sg_gen(
     ctx: SGContext, prompt: SGPrompt, max_tokens=240, seed_offset=0
 ) -> str:
     res = sg_gen_batched([ctx], [prompt], max_tokens, [seed_offset])
     return res[0]
+
 
 def sg_fork(
     ctx: SGContext, prompt: SGPrompt, n: int
@@ -1285,10 +934,12 @@ def sg_fork(
         out.append((ctx.clone(seed_offset=1000 + i), SGPrompt(prompt.text)))
     return out
 
+
 def sg_join(prompts: List[SGPrompt], joiner: str = "\n\n") -> SGPrompt:
     merged = SGPrompt("")
     merged.text = joiner.join(p.text for p in prompts)
     return merged
+
 
 def run_sglang_style_program(
     infile: str,
@@ -1416,24 +1067,11 @@ def train_bias_net(
             base_p = base_probs.detach().clone().to(dtype=torch.float32)
             base_p = base_p / (base_p.sum() + 1e-12)
             base_p = gen.focus_layer(base_p.view(1, 1, -1)).squeeze(0).squeeze(0)
-
             boosts = torch.tensor(
                 [prep.state.token_boost.get(w, 0.0) for w in cand]
             ).view(-1)
-
-            # also include geometric bias during training for consistency
-            vocab_index = {w: i for i, w in enumerate(prep.state.vocab100)}
-            gb = prep.state.geometric_bias
-            geom_vals = []
-            for w in cand:
-                idx = vocab_index.get(w, -1)
-                geom_vals.append(float(gb[idx]) if idx >= 0 else 0.0)
-            geom = torch.tensor(geom_vals, dtype=torch.float32).view(-1)
-
-            boosts_total = boosts + float(gen.geometric_strength) * geom
-
-            bias = gen.synthetic_bias(base_p, boosts_total).view(-1)
-            probs = gen.gate_layer(base_p, boosts_total + bias, temp=0.9)
+            bias = gen.synthetic_bias(base_p, boosts).view(-1)
+            probs = gen.gate_layer(base_p, boosts + bias, temp=0.9)
 
             try:
                 j = cand.index(true_next)
@@ -1464,10 +1102,10 @@ def train_bias_net(
 
 def build_app():
     with gr.Blocks(
-        title="Neurosymbolic V3.6 (Gaspare + Fortune Voronoi Bias)"
+        title="Neurosymbolic V3.6 (Gaspare + Seed-based Sparsification)"
     ) as demo:
         gr.Markdown(
-            "# Neurosymbolic V3.6: Gaspare-style Graphs + Fortune Voronoi Bias + SGLang Runtime\n"
+            "# Neurosymbolic V3.6: Gaspare-style Graphs + SGLang Runtime\n"
             "*Continuous Batching, RadixCache, Speculative Decoding*"
         )
 

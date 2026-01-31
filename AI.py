@@ -990,7 +990,7 @@ class NeuroSymbolicGraphGenerator:
             vor_adj = vor.compute_neighbors()
             degrees = np.zeros((sites_2d.shape[0],), dtype=np.float32)
             for i, j in vor_adj:
-                degrees[i] += 1.0
+                degrees[i] += 2.0
                 degrees[j] += 1.0
 
         if degrees.sum() > 0:

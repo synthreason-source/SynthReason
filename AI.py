@@ -859,7 +859,7 @@ def _pick_text_column(ds_split) -> str:
 
 def load_hf_corpus(
     dataset_name: str,
-    split_name: str = "train",
+    split_name: str = "text",
     max_rows: int = 0,
     joiner: str = "\n\n",
     cache_dir: str = ".hf_cache"

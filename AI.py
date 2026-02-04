@@ -4,13 +4,13 @@
 Graph-Theoretic Neurosymbolic Text Generator (Gradio GUI)
 V3.8 + Sugeno Fuzzy Logic Control (No Neural Gate, No Argmax)
 
-Changes:
-- Replaced ResonantGate/SyntheticGELUBias with FuzzyWeightController (Sugeno type).
-- Removed argmax/deterministic decoding; purely probabilistic with fuzzy-adjusted temp/steer.
-- Logic gates (AND/OR via t-norm/s-norm) control inference dynamics.
+HF Dataset integration:
+- Adds option to load Hugging Face dataset "AiresPucrs/stanford-encyclopedia-philosophy"
+- Auto-detects the dataset "text" column (or best string column)
+- Joins rows into one corpus string and runs your generator on it
 
 Dependencies:
-  pip install gradio numpy torch
+  pip install gradio numpy torch datasets
 """
 
 from __future__ import annotations
@@ -20,12 +20,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Any
 from collections import OrderedDict
+
 import numpy as np
 import gradio as gr
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
+import torch.optim as optim  # kept (unused, but harmless)
+
+# HF datasets
+from datasets import load_dataset, Value
 
 
 STOP_WORDS = set(
@@ -54,10 +58,10 @@ def pure_tfidf(docs: List[str], max_features: int = 8000) -> Tuple[np.ndarray, L
         word_counts = {}
         for word in re.findall(r"\b\w+\b", doc.lower()):
             word_counts[word] = word_counts.get(word, 0) + 1
-        
+
         if not word_counts:
             continue
-            
+
         uniq = len(word_counts)
         for word, count in word_counts.items():
             if word in word_to_idx:
@@ -146,6 +150,26 @@ def load_text(path: str) -> str:
     if p.suffix.lower() in [".txt", ".md"]:
         return p.read_text(encoding="utf-8", errors="replace")
     raise ValueError("Unsupported file extension")
+
+def _resolve_gradio_file_to_path(infile) -> str:
+    """
+    Gradio versions vary:
+    - may pass a tempfile object with .name
+    - may pass a dict-like with 'path'
+    - may pass a plain string path
+    """
+    if infile is None:
+        raise ValueError("No input file provided.")
+    if isinstance(infile, str):
+        return infile
+    if hasattr(infile, "name") and isinstance(infile.name, str):
+        return infile.name
+    if isinstance(infile, dict) and "path" in infile:
+        return str(infile["path"])
+    # last resort: try attribute 'path'
+    if hasattr(infile, "path"):
+        return str(infile.path)
+    raise ValueError(f"Unsupported infile type: {type(infile)}")
 
 
 # ----------------------------
@@ -246,7 +270,8 @@ def mf_trap(x: torch.Tensor, a: float, b: float, c: float, d: float) -> torch.Te
     x = x.clamp(min=min(a, d), max=max(a, d))
     up = (x - a) / max(1e-9, (b - a))
     down = (d - x) / max(1e-9, (d - c))
-    return torch.clamp(torch.minimum(torch.minimum(up, torch.tensor(1.0, device=x.device)), down), 0.0, 1.0)
+    one = torch.tensor(1.0, device=x.device, dtype=x.dtype)
+    return torch.clamp(torch.minimum(torch.minimum(up, one), down), 0.0, 1.0)
 
 def tnorm_prod(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return a * b
@@ -294,9 +319,9 @@ class FuzzyWeightController(nn.Module):
         # R4: Low entropy AND Mid peak -> Low Gain (stable)
         w4 = tnorm_prod(e_low, p_mid)
 
-        Z = torch.tensor([self.z_high, self.z_mid, self.z_low, self.z_low], device=e.device)
+        Z = torch.tensor([self.z_high, self.z_mid, self.z_low, self.z_low], device=e.device, dtype=torch.float32)
         W = torch.stack([w1, w2, w3, w4]).to(dtype=torch.float32).clamp_min(0.0)
-        
+
         g = (W * Z).sum() / (W.sum() + 1e-12)
         return g.clamp(0.0, 1.0)
 
@@ -451,7 +476,8 @@ class RadixLRUCache:
 
     def get(self, key):
         v = self._od.get(key, None)
-        if v is None: return None
+        if v is None:
+            return None
         self._od.move_to_end(key)
         return v
 
@@ -460,7 +486,7 @@ class RadixLRUCache:
         self._od.move_to_end(key)
         if len(self._od) > self.max_items:
             self._od.popitem(last=False)
-    
+
     def clear(self):
         self._od.clear()
 
@@ -496,13 +522,13 @@ class NeuroSymbolicGraphGenerator:
         self.rfe_enabled = bool(rfe_enabled)
         self.rfe_iterations = int(rfe_iterations)
         self.rfe_removal_rate = float(rfe_removal_rate)
-        
+
         self.base_steer = float(steer_strength)
         self.base_temp = float(softmax_temp)
 
         self.focus_layer = LateralInhibition(strength=float(focus_strength))
         self.fuzzy_ctl = FuzzyWeightController()
-        
+
         self.pruner: Optional[SynapticPruner] = None
         self.cache_version = 0
         self.radix_cache = RadixLRUCache(max_items=int(radix_cache_items))
@@ -513,9 +539,12 @@ class NeuroSymbolicGraphGenerator:
 
     def _pick_initial_context(self, lm: QuadgramLM, seed_words: List[str]) -> Tuple[str, str, str]:
         sw = [t for t in seed_words if re.match(r"^[a-z][a-z0-9_\-']*$", t)]
-        if len(sw) >= 3: return (sw[-3], sw[-2], sw[-1])
-        if len(sw) == 2: return (sw[-2], sw[-1], sw[-1])
-        if len(sw) == 1: return (sw[-1], sw[-1], sw[-1])
+        if len(sw) >= 3:
+            return (sw[-3], sw[-2], sw[-1])
+        if len(sw) == 2:
+            return (sw[-2], sw[-1], sw[-1])
+        if len(sw) == 1:
+            return (sw[-1], sw[-1], sw[-1])
         seed_tok = lm.vocab[0] if lm.vocab else "the"
         return (seed_tok, seed_tok, seed_tok)
 
@@ -538,9 +567,8 @@ class NeuroSymbolicGraphGenerator:
                 progress(0.80 + 0.05 * (iteration / max(1, self.rfe_iterations)), desc=f"Synaptic Pruning {iteration+1}")
             W_modulated = self.pruner(W_curr)
             var_term = 0.0
-            if W_modulated.size(0) >= 2:  # need at least 2 samples for correction=1
+            if W_modulated.size(0) >= 2:
                 var_term = torch.var(W_modulated, dim=0, correction=1).sum()
-            # else var_term stays 0, avoids warning
 
             loss = -torch.sum(W_modulated * energies.view(-1, 1)) + 0.1 * var_term
             loss.backward()
@@ -550,7 +578,8 @@ class NeuroSymbolicGraphGenerator:
                 importance = 0.6 * weights + 0.4 * grads
                 importance = importance / (importance.max() + 1e-12)
                 n_keep = int(kept_mask.sum().item() * (1.0 - self.rfe_removal_rate))
-                if n_keep < 10: break
+                if n_keep < 10:
+                    break
                 active = torch.where(kept_mask)[0]
                 local_importance = importance[active]
                 _, top_local = torch.topk(local_importance, k=min(n_keep, local_importance.numel()))
@@ -558,7 +587,7 @@ class NeuroSymbolicGraphGenerator:
                 new_mask[active[top_local]] = True
                 kept_mask = new_mask
                 W_curr.grad.zero_()
-        
+
         with torch.no_grad():
             final_idx = torch.where(kept_mask)[0]
             W_final = W[:, final_idx]
@@ -566,7 +595,8 @@ class NeuroSymbolicGraphGenerator:
         return W_final, vocab_final
 
     def build_state(self, text: str, progress=None) -> ModelState:
-        if progress: progress(0, desc="Normalizing")
+        if progress:
+            progress(0, desc="Normalizing")
         text = normalize(text)
         docs = re.split(r"\n\s*\n", text)[:500]
         X, vocab = pure_tfidf(docs, max_features=8000)
@@ -594,7 +624,8 @@ class NeuroSymbolicGraphGenerator:
 
         W = torch.tensor(svd.components_, dtype=torch.float32)
         W = F.relu(W)
-        if W.numel() > 0: W = W / (W.max(dim=1, keepdim=True)[0] + 1e-12)
+        if W.numel() > 0:
+            W = W / (W.max(dim=1, keepdim=True)[0] + 1e-12)
 
         energies = torch.tensor([n.energy for n in nodelets], dtype=torch.float32) if nodelets else torch.ones(1)
         energies = energies / (energies.max() + 1e-12)
@@ -660,7 +691,7 @@ class NeuroSymbolicGraphGenerator:
 
         # Fuzzy Logic Control
         g = self.fuzzy_ctl(entropy01, peak01, boost01)
-        
+
         # Apply fuzzy gain
         effective_steer = self.base_steer * float(g.item())
         effective_temp = self.base_temp * (1.2 - 0.7 * float(g.item()))
@@ -701,23 +732,24 @@ class ContinuousBatchDecoder:
     def _sample_fuzzy(self, cand: List[str], probs: torch.Tensor, g: float) -> str:
         p = probs.detach().cpu().numpy().astype(np.float64)
         p = p / (float(p.sum()) + 1e-12)
-        
+
         # Fuzzy-controlled Gaspare pruning
         # Higher g (gain) -> tighter distribution -> stricter cutoff
         mu = float(np.mean(p))
         std = float(np.std(p))
-        cutoff = mu + (1.0 - g) * std  # Deterministic logic-based cutoff
-        
+        cutoff = mu + (1.0 - g) * std
+
         p_sparse = np.where(p > cutoff, p, 0.0)
         if float(p_sparse.sum()) < 1e-12:
             p_sparse = p
-            
+
         p_sparse = p_sparse / (float(p_sparse.sum()) + 1e-12)
         return self.rng.choice(cand, p=p_sparse)
 
     def step_round(self, streams: List[DecodeStream]) -> None:
         active = [s for s in streams if not s.done]
-        if not active: return
+        if not active:
+            return
         active.sort(key=lambda s: (s.w1, s.w2, s.w3))
         active = active[: min(len(active), self.token_budget_per_round)]
 
@@ -731,9 +763,10 @@ class ContinuousBatchDecoder:
             for s in bucket:
                 nxt = self._sample_fuzzy(cand, final_probs, g)
                 s.tokens_out.append(nxt)
-                if nxt.isalpha(): s.alpha_count += 1
+                if nxt.isalpha():
+                    s.alpha_count += 1
                 s.w1, s.w2, s.w3 = s.w2, s.w3, nxt
-                
+
                 if s.alpha_count >= s.max_steps:
                     s.done = True
                 elif nxt in s.stop_tokens and s.alpha_count > s.min_alpha:
@@ -766,26 +799,32 @@ class SGContext:
         return ctx
 
 def sg_gen_batched(ctxs, prompts, max_tokens=240, seed_offsets=None, stop_at_punc=True):
-    if not ctxs: return []
+    if not ctxs:
+        return []
     gen = ctxs[0].generator
     ctxs[0].ensure_prepared()
     prep = ctxs[0].prepared
     rng = np.random.default_rng(int(ctxs[0].seed))
-    
+
     streams = []
     for i, (ctx, prompt) in enumerate(zip(ctxs, prompts)):
         off = seed_offsets[i] if seed_offsets else i
         local_seed = int(ctx.seed + off)
-        local_rng = np.random.default_rng(local_seed)
+        local_rng = np.random.default_rng(local_seed)  # kept (unused)
         seed_words = basic_tokenize(prompt.text)
         w1, w2, w3 = gen._pick_initial_context(prep.lm, seed_words)
-        streams.append(DecodeStream(i, [w1, w2, w3], w1, w2, w3, max_steps=max_tokens, min_alpha=max_tokens//2 if stop_at_punc else 99999))
-    
+        streams.append(DecodeStream(
+            i, [w1, w2, w3], w1, w2, w3,
+            max_steps=max_tokens,
+            min_alpha=max_tokens//2 if stop_at_punc else 99999
+        ))
+
     decoder = ContinuousBatchDecoder(gen, prep, rng, token_budget_per_round=64)
     for _ in range(max_tokens * 2):
-        if all(s.done for s in streams): break
+        if all(s.done for s in streams):
+            break
         decoder.step_round(streams)
-    
+
     return [detokenize(s.tokens_out[3:]) for s in streams]
 
 def sg_fork(ctx, prompt, n):
@@ -795,8 +834,110 @@ def sg_fork(ctx, prompt, n):
 def sg_join(prompts, joiner="\n\n"):
     return SGPrompt(joiner.join(p.text for p in prompts))
 
-def run_sglang_style_program(infile, n_take, seed, steer, focus, takeaway_prompt, summary_prompt):
-    corpus_text = load_text(infile)
+# ----------------------------
+# HF Dataset Loader (NEW)
+# ----------------------------
+
+_PREFER_TEXT_COLS = ["text", "content", "article", "body", "markdown", "md", "html", "raw"]
+
+def _pick_text_column(ds_split) -> str:
+    feats = ds_split.features
+    string_cols = [k for k, v in feats.items() if isinstance(v, Value) and v.dtype == "string"]
+    if not string_cols:
+        # Sometimes nested structs exist; you can extend this if needed.
+        raise ValueError(f"No top-level string columns found. features={feats}")
+
+    for pref in _PREFER_TEXT_COLS:
+        for c in string_cols:
+            if c.lower() == pref:
+                return c
+    for pref in _PREFER_TEXT_COLS:
+        for c in string_cols:
+            if pref in c.lower():
+                return c
+    return string_cols[0]
+
+def load_hf_corpus(
+    dataset_name: str,
+    split_name: str = "train",
+    max_rows: int = 0,
+    joiner: str = "\n\n",
+    cache_dir: str = ".hf_cache"
+) -> Tuple[str, Dict[str, Any]]:
+    """
+    Returns (corpus_text, meta)
+    max_rows=0 means "all".
+    """
+    ds = load_dataset(dataset_name, cache_dir=cache_dir)
+    use_split = split_name if split_name in ds else next(iter(ds.keys()))
+    split = ds[use_split]
+    text_col = _pick_text_column(split)
+
+    n_total = len(split)
+    if isinstance(max_rows, float):
+        max_rows = int(max_rows)
+    if max_rows and max_rows > 0:
+        n_take = min(int(max_rows), n_total)
+        split = split.select(range(n_take))
+    else:
+        n_take = n_total
+
+    def _norm(s: str) -> str:
+        return normalize(s)
+
+    parts = []
+    for row in split:
+        v = row.get(text_col, None)
+        if isinstance(v, str):
+            v = _norm(v)
+            if v:
+                parts.append(v)
+
+    corpus = joiner.join(parts)
+    meta = {
+        "dataset": dataset_name,
+        "split": use_split,
+        "text_col": text_col,
+        "rows_used": n_take,
+        "rows_nonempty": len(parts),
+        "chars": len(corpus),
+        "columns": list(split.column_names),
+    }
+    return corpus, meta
+
+
+# ----------------------------
+# Main program function (MODIFIED)
+# ----------------------------
+
+def run_program(
+    infile,
+    use_hf: bool,
+    hf_dataset: str,
+    hf_split: str,
+    hf_max_rows: int,
+    n_take: int,
+    seed: int,
+    steer: float,
+    focus: float,
+    takeaway_prompt: str,
+    summary_prompt: str,
+):
+    if use_hf:
+        corpus_text, meta = load_hf_corpus(
+            dataset_name=str(hf_dataset).strip(),
+            split_name=str(hf_split).strip(),
+            max_rows=int(hf_max_rows) if hf_max_rows else 0,
+        )
+        header = (
+            f"[HF] dataset={meta['dataset']} split={meta['split']} text_col={meta['text_col']} "
+            f"rows_used={meta['rows_used']} nonempty={meta['rows_nonempty']} chars={meta['chars']}\n\n"
+        )
+    else:
+        path = _resolve_gradio_file_to_path(infile)
+        corpus_text = load_text(path)
+        header = f"[FILE] {Path(path).name} chars={len(corpus_text)}\n\n"
+
     gen = NeuroSymbolicGraphGenerator(
         steer_strength=float(steer),
         focus_strength=float(focus),
@@ -804,15 +945,13 @@ def run_sglang_style_program(infile, n_take, seed, steer, focus, takeaway_prompt
     )
     ctx = SGContext(corpus_text, gen, seed=int(seed))
     ctx.ensure_prepared()
-    
+
     root = SGPrompt(str(takeaway_prompt).strip() + "\n\n")
     branches = sg_fork(ctx, root, n=int(n_take))
     branch_ctxs, branch_prompts = zip(*branches)
-
     branch_ctxs = list(branch_ctxs)
     branch_prompts = list(branch_prompts)
 
-    # now mutation works
     for i, bp in enumerate(branch_prompts):
         bp += f"[Takeaway {i+1}] "
 
@@ -820,41 +959,67 @@ def run_sglang_style_program(infile, n_take, seed, steer, focus, takeaway_prompt
 
     for i, txt in enumerate(take_texts):
         branch_prompts[i] += txt
-        
+
     merged = sg_join(branch_prompts, joiner="\n\n")
     final_prompt = SGPrompt(summary_prompt.replace("{joined_takeaways}", merged.text))
     final_text = sg_gen_batched([ctx], [final_prompt], max_tokens=260)[0]
-    
-    return final_prompt.text + final_text
+
+    return header + final_prompt.text + final_text
 
 
 # ----------------------------
-# Gradio
+# Gradio (MODIFIED)
 # ----------------------------
 
 def build_app():
-    with gr.Blocks(title="Neurosymbolic V3.8 (Sugeno Fuzzy Logic)") as demo:
-        gr.Markdown("# Neurosymbolic V3.8: Sugeno Fuzzy Logic Control\n*Logic gates (AND/OR) control inference dynamics. No neural gates. No Argmax.*")
-        
+    with gr.Blocks(title="Neurosymbolic V3.8 (Sugeno Fuzzy Logic) + HF Dataset") as demo:
+        gr.Markdown(
+            "# Neurosymbolic V3.8: Sugeno Fuzzy Logic Control\n"
+            "*Logic gates (AND/OR) control inference dynamics. No neural gates. No Argmax.*\n\n"
+            "You can upload a corpus file **or** load a Hugging Face dataset."
+        )
+
         with gr.Row():
-            infile = gr.File(label="Input File (txt/md)")
-            out_txt = gr.Textbox(label="Output", lines=20)
-        
+            with gr.Column(scale=1):
+                use_hf = gr.Checkbox(label="Use Hugging Face dataset", value=True)
+
+                hf_dataset = gr.Textbox(
+                    label="HF dataset name",
+                    value="AiresPucrs/stanford-encyclopedia-philosophy",
+                    interactive=True,
+                )
+                hf_split = gr.Textbox(label="HF split (optional)", value="train", interactive=True)
+                hf_max_rows = gr.Slider(0, 20000, value=2000, step=100, label="HF max rows (0 = all)")
+
+                infile = gr.File(label="Input File (txt/md) if not using HF", file_types=[".txt", ".md"])
+
+            with gr.Column(scale=2):
+                out_txt = gr.Textbox(label="Output", lines=24)
+
         with gr.Row():
             n_take = gr.Slider(1, 10, value=5, label="Parallel Batches")
             seed = gr.Number(value=42, label="Seed")
-            
+
         with gr.Row():
             steer = gr.Slider(0, 5, value=1.35, label="Base Steer")
             focus = gr.Slider(0, 1, value=0.5, label="Focus")
-            
+
         p_takeaway = gr.Textbox(label="Prefix", value="", lines=2)
-        p_summary = gr.Textbox(label="Summary Prompt", value="explain this?\n\n{joined_takeaways}\n\nplan:", lines=4)
-        
+        p_summary = gr.Textbox(
+            label="Summary Prompt",
+            value="explain this?\n\n{joined_takeaways}\n\nplan:",
+            lines=4
+        )
+
         btn = gr.Button("Run Fuzzy Logic Generator", variant="primary")
-        btn.click(run_sglang_style_program, inputs=[infile, n_take, seed, steer, focus, p_takeaway, p_summary], outputs=out_txt)
-        
+        btn.click(
+            run_program,
+            inputs=[infile, use_hf, hf_dataset, hf_split, hf_max_rows, n_take, seed, steer, focus, p_takeaway, p_summary],
+            outputs=out_txt
+        )
+
     return demo
+
 
 if __name__ == "__main__":
     app = build_app()

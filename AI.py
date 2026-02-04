@@ -988,7 +988,7 @@ def build_app():
                     value="AiresPucrs/stanford-encyclopedia-philosophy",
                     interactive=True,
                 )
-                hf_split = gr.Textbox(label="HF split (optional)", value="train", interactive=True)
+                hf_split = gr.Textbox(label="HF split (optional)", value="text", interactive=True)
                 hf_max_rows = gr.Slider(0, 20000, value=2000, step=100, label="HF max rows (0 = all)")
 
                 infile = gr.File(label="Input File (txt/md) if not using HF", file_types=[".txt", ".md"])
@@ -1007,7 +1007,7 @@ def build_app():
         p_takeaway = gr.Textbox(label="Prefix", value="", lines=2)
         p_summary = gr.Textbox(
             label="Summary Prompt",
-            value="explain this?\n\n{joined_takeaways}\n\nplan:",
+            value="explain this?",
             lines=4
         )
 

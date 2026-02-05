@@ -2,10 +2,21 @@
 # -*- coding: utf-8 -*-
 """
 Graph-Theoretic Neurosymbolic Text Generator (Gradio GUI)
-V3.8 + Sugeno Fuzzy Logic Control (No Neural Gate, No Argmax)
+V3.9 + Sugeno Fuzzy Logic Control (No Neural Gate, No Argmax)
+
+MOD (2026-02-05): "Pertinent points of inference"
+- Adds an inference-point extractor that ranks sentences as "pertinent inferences"
+  using:
+  (a) your existing token_boost map (topic/TFIDF-SVD derived),
+  (b) a light structural similarity score vs the corpus token-graph degree histogram,
+  (c) dedupe + length constraints.
+- Adds GUI controls:
+  - Output mode: "Inference points" vs "Raw generated text"
+  - Inference source: "From corpus" vs "From generated summary"
+  - K points slider
 
 HF Dataset integration:
-- Adds option to load Hugging Face dataset "AiresPucrs/stanford-encyclopedia-philosophy"
+- Option to load Hugging Face dataset "AiresPucrs/stanford-encyclopedia-philosophy"
 - Auto-detects the dataset "text" column (or best string column)
 - Joins rows into one corpus string and runs your generator on it
 
@@ -54,6 +65,8 @@ def pure_tfidf(docs: List[str], max_features: int = 8000) -> Tuple[np.ndarray, L
     word_to_idx = {w: i for i, w in enumerate(vocab)}
 
     X = np.zeros((len(docs), len(vocab)))
+    # NOTE: This is O(N_docs^2) due to df calculation per token.
+    # Kept as-is to preserve your original intent.
     for i, doc in enumerate(docs):
         word_counts = {}
         for word in re.findall(r"\b\w+\b", doc.lower()):
@@ -166,10 +179,22 @@ def _resolve_gradio_file_to_path(infile) -> str:
         return infile.name
     if isinstance(infile, dict) and "path" in infile:
         return str(infile["path"])
-    # last resort: try attribute 'path'
     if hasattr(infile, "path"):
         return str(infile.path)
     raise ValueError(f"Unsupported infile type: {type(infile)}")
+
+def _clamp_int(x, lo: int, hi: int) -> int:
+    try:
+        x = int(x)
+    except Exception:
+        x = lo
+    return max(lo, min(hi, x))
+
+def _safe_float(x, default: float = 0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return float(default)
 
 
 # ----------------------------
@@ -296,7 +321,6 @@ class FuzzyWeightController(nn.Module):
         p = peak01.clamp(0, 1)
         b = boost01.clamp(0, 1)
 
-        # Memberships
         e_low  = mf_trap(e, 0.0, 0.0, 0.25, 0.45)
         e_mid  = mf_tri(e, 0.25, 0.50, 0.75)
         e_high = mf_trap(e, 0.55, 0.75, 1.0, 1.0)
@@ -310,14 +334,10 @@ class FuzzyWeightController(nn.Module):
         b_high = mf_trap(b, 0.55, 0.80, 1.0, 1.0)
 
         # Rules
-        # R1: High entropy AND Low peak -> High Gain (explore)
-        w1 = tnorm_prod(e_high, p_low)
-        # R2: Mid entropy AND Mid boost -> Mid Gain
-        w2 = tnorm_prod(e_mid, b_mid)
-        # R3: High peak OR High boost -> Low Gain (confident/already steered)
-        w3 = snorm_max(p_high, b_high)
-        # R4: Low entropy AND Mid peak -> Low Gain (stable)
-        w4 = tnorm_prod(e_low, p_mid)
+        w1 = tnorm_prod(e_high, p_low)         # explore
+        w2 = tnorm_prod(e_mid, b_mid)          # balanced
+        w3 = snorm_max(p_high, b_high)         # already confident/steered
+        w4 = tnorm_prod(e_low, p_mid)          # stable
 
         Z = torch.tensor([self.z_high, self.z_mid, self.z_low, self.z_low], device=e.device, dtype=torch.float32)
         W = torch.stack([w1, w2, w3, w4]).to(dtype=torch.float32).clamp_min(0.0)
@@ -676,16 +696,12 @@ class NeuroSymbolicGraphGenerator:
         base_p = self.focus_layer(base_p.view(1, 1, -1)).squeeze(0).squeeze(0)
 
         # Fuzzy Feature Extraction
-        # 1. Entropy (normalized)
         val = base_p.clamp_min(1e-12)
         H = -torch.sum(base_p * torch.log(val))
         V = float(base_p.numel())
         entropy01 = (H / max(1e-9, math.log(max(2.0, V)))).clamp(0.0, 1.0)
-
-        # 2. Peak prob
         peak01 = base_p.max().clamp(0.0, 1.0)
 
-        # 3. Boost magnitude
         boosts = torch.tensor([prep.state.token_boost.get(w, 0.0) for w in cand], dtype=torch.float32).view(-1)
         boost01 = torch.tanh(boosts.abs().mean() / 3.0).clamp(0.0, 1.0)
 
@@ -733,8 +749,6 @@ class ContinuousBatchDecoder:
         p = probs.detach().cpu().numpy().astype(np.float64)
         p = p / (float(p.sum()) + 1e-12)
 
-        # Fuzzy-controlled Gaspare pruning
-        # Higher g (gain) -> tighter distribution -> stricter cutoff
         mu = float(np.mean(p))
         std = float(np.std(p))
         cutoff = mu + (1.0 - g) * std
@@ -789,7 +803,7 @@ class SGContext:
         self.corpus_text = normalize(corpus_text)
         self.generator = generator
         self.seed = int(seed)
-        self.prepared = None
+        self.prepared: Optional[PreparedCorpus] = None
     def ensure_prepared(self):
         if self.prepared is None:
             self.prepared = self.generator.prepare_corpus(self.corpus_text)
@@ -834,8 +848,9 @@ def sg_fork(ctx, prompt, n):
 def sg_join(prompts, joiner="\n\n"):
     return SGPrompt(joiner.join(p.text for p in prompts))
 
+
 # ----------------------------
-# HF Dataset Loader (NEW)
+# HF Dataset Loader
 # ----------------------------
 
 _PREFER_TEXT_COLS = ["text", "content", "article", "body", "markdown", "md", "html", "raw"]
@@ -844,7 +859,6 @@ def _pick_text_column(ds_split) -> str:
     feats = ds_split.features
     string_cols = [k for k, v in feats.items() if isinstance(v, Value) and v.dtype == "string"]
     if not string_cols:
-        # Sometimes nested structs exist; you can extend this if needed.
         raise ValueError(f"No top-level string columns found. features={feats}")
 
     for pref in _PREFER_TEXT_COLS:
@@ -907,6 +921,133 @@ def load_hf_corpus(
 
 
 # ----------------------------
+# Inference-point extraction (NEW)
+# ----------------------------
+
+def split_sentences(text: str, max_sentences: int = 5000) -> List[str]:
+    """
+    Conservative sentence splitter: splits on [.?!] followed by whitespace/newline.
+    Keeps sentence punctuation.
+    """
+    t = normalize(text)
+    if not t:
+        return []
+    parts = re.split(r"(?<=[.!?])\s+", t)
+    out = []
+    for s in parts:
+        s = s.strip()
+        if not s:
+            continue
+        out.append(s)
+        if len(out) >= max_sentences:
+            break
+    return out
+
+def _deg_hist_similarity(ref_hist: np.ndarray, sent_hist: np.ndarray) -> float:
+    """
+    Returns [0,1] similarity based on L1 distance between normalized histograms.
+    """
+    a = ref_hist.astype(float)
+    b = sent_hist.astype(float)
+    a = a / (a.sum() + 1e-12)
+    b = b / (b.sum() + 1e-12)
+    d = float(np.abs(a - b).sum())
+    return float(max(0.0, 1.0 - 0.5 * d))  # heuristic scaling
+
+def score_sentence(sentence: str, prep: PreparedCorpus) -> Tuple[float, Dict[str, float]]:
+    """
+    Scores a sentence as a 'pertinent inference point' using:
+    - token_boost mass (semantic pertinence),
+    - unique boosted-token count (coverage),
+    - brevity penalty,
+    - structural similarity to corpus token-graph degree histogram.
+    """
+    toks = basic_tokenize(sentence)
+    if not toks:
+        return -1e9, {"boost_sum": 0.0, "boost_uniq": 0.0, "len": 0.0, "struct": 0.0}
+
+    # semantic score from your topic-derived boost map
+    boost_vals = [prep.state.token_boost.get(t, 0.0) for t in toks if t.isalpha()]
+    boost_sum = float(sum(v for v in boost_vals if v > 0))
+    boost_uniq = float(len({t for t in toks if prep.state.token_boost.get(t, 0.0) > 0.0}))
+
+    # structural score: compare sentence graph degree histogram to corpus reference
+    Gs = SimpleGraph.from_token_sequence(toks, max_nodes=220)
+    sent_sig = graph_signature(Gs)
+    struct_sim = _deg_hist_similarity(prep.ref_sig["deg_hist"], sent_sig["deg_hist"])
+
+    # brevity / shape constraints as soft penalties
+    n_alpha = sum(1 for t in toks if t.isalpha())
+    n_total = len(toks)
+    alpha_ratio = n_alpha / max(1, n_total)
+
+    # scoring mix (tuned to prefer concise, content-heavy sentences)
+    score = (
+        1.00 * boost_sum +
+        0.65 * boost_uniq +
+        1.20 * struct_sim +
+        0.40 * alpha_ratio -
+        0.03 * n_total
+    )
+    meta = {
+        "boost_sum": boost_sum,
+        "boost_uniq": boost_uniq,
+        "len": float(n_total),
+        "struct": float(struct_sim),
+        "alpha_ratio": float(alpha_ratio),
+    }
+    return float(score), meta
+
+def extract_pertinent_points(
+    source_text: str,
+    prep: PreparedCorpus,
+    k_points: int = 12,
+    min_words: int = 6,
+    max_words: int = 40,
+    max_scan_sentences: int = 4000,
+) -> List[str]:
+    sents = split_sentences(source_text, max_sentences=max_scan_sentences)
+    scored = []
+    for s in sents:
+        words = re.findall(r"[A-Za-z]+", s)
+        if len(words) < int(min_words) or len(words) > int(max_words):
+            continue
+        sc, meta = score_sentence(s, prep)
+        scored.append((sc, s))
+
+    if not scored:
+        return []
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    # Dedupe by normalized bag-of-words signature
+    def key_norm(s: str) -> str:
+        toks = [t for t in basic_tokenize(s) if t.isalpha() and t not in STOP_WORDS]
+        toks = toks[:80]
+        return " ".join(sorted(set(toks)))
+
+    seen = set()
+    out = []
+    for _, s in scored:
+        ksig = key_norm(s)
+        if not ksig or ksig in seen:
+            continue
+        seen.add(ksig)
+        out.append(s.strip())
+        if len(out) >= int(k_points):
+            break
+    return out
+
+def format_points(points: List[str]) -> str:
+    if not points:
+        return "No inference points found (try raising HF max rows, or lowering min/max words)."
+    lines = ["Pertinent points of inference:"]
+    for i, p in enumerate(points, 1):
+        lines.append(f"{i}. {p}")
+    return "\n".join(lines)
+
+
+# ----------------------------
 # Main program function (MODIFIED)
 # ----------------------------
 
@@ -922,6 +1063,9 @@ def run_program(
     focus: float,
     takeaway_prompt: str,
     summary_prompt: str,
+    output_mode: str,
+    inference_source: str,
+    k_points: int,
 ):
     if use_hf:
         corpus_text, meta = load_hf_corpus(
@@ -945,7 +1089,16 @@ def run_program(
     )
     ctx = SGContext(corpus_text, gen, seed=int(seed))
     ctx.ensure_prepared()
+    prep = ctx.prepared
 
+    # If user wants only inference points and wants them from the corpus directly,
+    # we can skip generation entirely (fast and "actual inference from input").
+    k_points = _clamp_int(k_points, 3, 40)
+    if output_mode == "Inference points" and inference_source == "From corpus":
+        pts = extract_pertinent_points(corpus_text, prep, k_points=k_points)
+        return header + format_points(pts)
+
+    # Otherwise we run your original branch->join->summary generation.
     root = SGPrompt(str(takeaway_prompt).strip() + "\n\n")
     branches = sg_fork(ctx, root, n=int(n_take))
     branch_ctxs, branch_prompts = zip(*branches)
@@ -962,9 +1115,19 @@ def run_program(
 
     merged = sg_join(branch_prompts, joiner="\n\n")
     final_prompt = SGPrompt(summary_prompt.replace("{joined_takeaways}", merged.text))
-    final_text = sg_gen_batched([ctx], [final_prompt], max_tokens=260)[0]
+    final_text = sg_gen_batched([ctx], [final_prompt], max_tokens=660)[0]
 
-    return header + final_prompt.text + final_text
+    if output_mode == "Raw generated text":
+        return header + final_prompt.text + final_text
+
+    # output_mode == "Inference points"
+    if inference_source == "From generated summary":
+        pts = extract_pertinent_points(final_text, prep, k_points=k_points)
+        return header + format_points(pts) + "\n\n" + "[Generated summary text]\n" + final_text
+
+    # inference_source == "From corpus" (but generation ran anyway)
+    pts = extract_pertinent_points(corpus_text, prep, k_points=k_points)
+    return header + format_points(pts) + "\n\n" + "[Generated summary text]\n" + final_text
 
 
 # ----------------------------
@@ -972,11 +1135,11 @@ def run_program(
 # ----------------------------
 
 def build_app():
-    with gr.Blocks(title="Neurosymbolic V3.8 (Sugeno Fuzzy Logic) + HF Dataset") as demo:
+    with gr.Blocks(title="Neurosymbolic V3.9 (Sugeno Fuzzy Logic) + HF Dataset + Inference Points") as demo:
         gr.Markdown(
-            "# Neurosymbolic V3.8: Sugeno Fuzzy Logic Control\n"
+            "# Neurosymbolic V3.9: Sugeno Fuzzy Logic Control\n"
             "*Logic gates (AND/OR) control inference dynamics. No neural gates. No Argmax.*\n\n"
-            "You can upload a corpus file **or** load a Hugging Face dataset."
+            "This version can output **pertinent points of inference** ranked from the corpus (or from the generated summary)."
         )
 
         with gr.Row():
@@ -994,7 +1157,7 @@ def build_app():
                 infile = gr.File(label="Input File (txt/md) if not using HF", file_types=[".txt", ".md"])
 
             with gr.Column(scale=2):
-                out_txt = gr.Textbox(label="Output", lines=24)
+                out_txt = gr.Textbox(label="Output", lines=28)
 
         with gr.Row():
             n_take = gr.Slider(1, 10, value=5, label="Parallel Batches")
@@ -1004,17 +1167,39 @@ def build_app():
             steer = gr.Slider(0, 5, value=1.35, label="Base Steer")
             focus = gr.Slider(0, 1, value=0.5, label="Focus")
 
+        with gr.Row():
+            output_mode = gr.Radio(
+                choices=["Inference points", "Raw generated text"],
+                value="Inference points",
+                label="Output mode"
+            )
+            inference_source = gr.Radio(
+                choices=["From corpus", "From generated summary"],
+                value="From corpus",
+                label="Inference source"
+            )
+            k_points = gr.Slider(3, 40, value=12, step=1, label="Number of inference points (K)")
+
         p_takeaway = gr.Textbox(label="Prefix", value="", lines=2)
         p_summary = gr.Textbox(
             label="Summary Prompt",
-            value="explain this?",
-            lines=4
+            value=(
+                "Extract and explain the core claims and implications.\n"
+                "Then synthesize across takeaways:\n\n"
+                "{joined_takeaways}\n\n"
+                "Focus on what follows from what, and why."
+            ),
+            lines=6
         )
 
         btn = gr.Button("Run Fuzzy Logic Generator", variant="primary")
         btn.click(
             run_program,
-            inputs=[infile, use_hf, hf_dataset, hf_split, hf_max_rows, n_take, seed, steer, focus, p_takeaway, p_summary],
+            inputs=[
+                infile, use_hf, hf_dataset, hf_split, hf_max_rows,
+                n_take, seed, steer, focus, p_takeaway, p_summary,
+                output_mode, inference_source, k_points
+            ],
             outputs=out_txt
         )
 

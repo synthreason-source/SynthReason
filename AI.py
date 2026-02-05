@@ -1108,14 +1108,14 @@ def run_program(
     for i, bp in enumerate(branch_prompts):
         bp += f"[Takeaway {i+1}] "
 
-    take_texts = sg_gen_batched(branch_ctxs, branch_prompts, max_tokens=620, stop_at_punc=True)
+    take_texts = sg_gen_batched(branch_ctxs, branch_prompts, max_tokens=220, stop_at_punc=True)
 
     for i, txt in enumerate(take_texts):
         branch_prompts[i] += txt
 
     merged = sg_join(branch_prompts, joiner="\n\n")
     final_prompt = SGPrompt(summary_prompt.replace("{joined_takeaways}", merged.text))
-    final_text = sg_gen_batched([ctx], [final_prompt], max_tokens=660)[0]
+    final_text = sg_gen_batched([ctx], [final_prompt], max_tokens=260)[0]
 
     if output_mode == "Raw generated text":
         return header + final_prompt.text + final_text

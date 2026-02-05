@@ -1,163 +1,180 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Neurosymbolic Generator (Patched) — Separate Train / Generate
+Graph-Theoretic Neurosymbolic Text Generator (Gradio GUI)
+V3.8 + Sugeno Fuzzy Logic Control (No Neural Gate, No Argmax)
 
-Fixes from your pasted script + tracebacks:
-- basictokenize() missing -> alias to basictokenizetext(). [file:1]
-- sgfork() broken list-comprehension -> fixed and returns list of (ctx,prompt). [file:1]
-- backward() crash: "tensor does not require grad" -> make trainable params and ensure
-  training path returns non-detached probabilities (no caching in train). [file:1]
-- Fuzzy gain g sometimes 0 due to mftrap endpoint handling when a==b or c==d -> fixed.
-- "No inference points found" -> robust sentence splitting + adaptive filters + fallback.
-- Gradio UI: separate Train button and Generate button (not combined). [file:1]
+HF Dataset integration:
+- Adds option to load Hugging Face dataset "AiresPucrs/stanford-encyclopedia-philosophy"
+- Auto-detects the dataset "text" column (or best string column)
+- Joins rows into one corpus string and runs your generator on it
+
+Dependencies:
+  pip install gradio numpy torch datasets
 """
 
+from __future__ import annotations
 import re
 import math
-import random
-from pathlib import Path
-from collections import OrderedDict
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Any
+from collections import OrderedDict
 
 import numpy as np
+import gradio as gr
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+import torch.optim as optim  # kept (unused, but harmless)
 
-import gradio as gr
+# HF datasets
 from datasets import load_dataset, Value
 
 
-# =============================================================================
-# Utilities
-# =============================================================================
-
-STOPWORDS = set(
-    "a an and are as at be by for from has have he her hers him his i in is it its me my "
-    "of on or our ours she so that the their them they this to was we were what when where "
-    "which who will with you your yours".split()
+STOP_WORDS = set(
+    """
+    a an and are as at be by for from has have he her hers him his i in is it its me my
+    of on or our ours she so that the their them they this to was we were what when where
+    which who will with you your yours
+    """.split()
 )
 
-PUNCT = set(list(".,!?;:"))
+# ----------------------------
+# Pure-Python TF-IDF + SVD
+# ----------------------------
+
+def pure_tfidf(docs: List[str], max_features: int = 8000) -> Tuple[np.ndarray, List[str]]:
+    all_words = set()
+    for doc in docs:
+        words = re.findall(r"\b\w+\b", doc.lower())
+        all_words.update(words)
+
+    vocab = list(all_words)[:max_features]
+    word_to_idx = {w: i for i, w in enumerate(vocab)}
+
+    X = np.zeros((len(docs), len(vocab)))
+    for i, doc in enumerate(docs):
+        word_counts = {}
+        for word in re.findall(r"\b\w+\b", doc.lower()):
+            word_counts[word] = word_counts.get(word, 0) + 1
+
+        if not word_counts:
+            continue
+
+        uniq = len(word_counts)
+        for word, count in word_counts.items():
+            if word in word_to_idx:
+                j = word_to_idx[word]
+                tf = count / uniq
+                df = sum(1 for d in docs if word in d.lower())
+                idf = math.log(len(docs) / (1 + df))
+                X[i, j] = tf * idf
+    return X, vocab
 
 
-def normalizetext(text: str) -> str:
-    text = (text or "").replace("\t", " ").replace("\r", " ").replace("\n", " ")
-    text = re.sub(r"\s+", " ", text)
-    text = re.sub(r"\.{3,}", "...", text)
+def pure_truncated_svd(X: np.ndarray, n_components: int, random_state: int = 42) -> Any:
+    np.random.seed(random_state)
+    m, n = X.shape
+    k = min(n_components, min(m, n))
+    if k < 1:
+        return type("SVD", (), {"components_": np.zeros((0, n))})()
+
+    Q = np.random.randn(n, k)
+    Q, _ = np.linalg.qr(Q)
+
+    for _ in range(10):
+        B = X.T @ X @ Q
+        Q, _ = np.linalg.qr(B)
+
+    B = X @ Q
+    U, S, Vt = np.linalg.svd(B, full_matrices=False)
+    return type("SVD", (), {"components_": Vt[:k]})()
+
+
+# ----------------------------
+# Helper Functions
+# ----------------------------
+
+def _token_class(tok: str) -> str:
+    if tok in [".", ",", ";", ":", "!", "?", "(", ")"]:
+        return "PUNC"
+    if not re.match(r"[a-z]", tok):
+        return "OTHER"
+    L = len(tok)
+    return "S" if L <= 3 else "M" if L <= 7 else "L"
+
+def normalize(text: str) -> str:
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
-
-def basictokenizetext(text: str) -> List[str]:
-    text = (text or "").replace("_", " ")
-    # words, alnum-hyphen, punctuation
-    tokens = re.findall(r"[A-Za-z]+|[A-Za-z0-9-]+|[.,!?;:]", text)
-    out: List[str] = []
+def basic_tokenize(text: str) -> List[str]:
+    text = text.replace("\n", " ")
+    tokens = re.findall(r"[A-Za-z][A-Za-z0-9_\-']*|[.,;:!?()]", text)
+    out = []
     for t in tokens:
-        if re.match(r"^[A-Za-z]", t):
+        if re.match(r"[A-Za-z]", t):
             out.append(t.lower())
         else:
             out.append(t)
     return out
 
-
-# Compatibility alias (your original code calls basictokenize everywhere). [file:1]
-def basictokenize(text: str) -> List[str]:
-    return basictokenizetext(text)
-
-
-def detokenizetokens(tokens: List[str]) -> str:
-    toks = tokens or []
-    out: List[str] = []
-    for t in toks:
-        if t in PUNCT:
-            if out:
-                out[-1] = out[-1] + t
+def detokenize(tokens: List[str]) -> str:
+    out = []
+    for t in tokens:
+        if t in [".", ",", ";", ":", "!", "?", ")", "("]:
+            if t in ["(", ")"]:
+                out.append(t)
+            else:
+                if out:
+                    out[-1] += t
+                else:
+                    out.append(t)
+        else:
+            if out and out[-1].endswith("("):
+                out[-1] += t
             else:
                 out.append(t)
-        else:
-            out.append(t)
     s = " ".join(out)
-    s = re.sub(r"\s+", " ", s)
-    s = re.sub(r"\s([.,!?;:])", r"\1", s)
-    # sentence-case after .,!,?
-    s = re.sub(r"([.!?])\s+([a-z])", lambda m: m.group(1) + " " + m.group(2).upper(), s)
-    return s.strip()
+    s = re.sub(r"\(\s+", "(", s)
+    s = re.sub(r"\s+\)", ")", s)
+    s = re.sub(r"(^|[.!?]\s+)([a-z])", lambda m: m.group(1) + m.group(2).upper(), s)
+    return s
 
-
-def detokenize(tokens: List[str]) -> str:
-    return detokenizetokens(tokens)
-
-
-def loadtext(path: str) -> str:
+def load_text(path: str) -> str:
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"File not found: {p}")
-    if p.suffix.lower() in {".txt", ".md"}:
+    if p.suffix.lower() in [".txt", ".md"]:
         return p.read_text(encoding="utf-8", errors="replace")
-    raise ValueError("Unsupported file extension; use .txt or .md")
+    raise ValueError("Unsupported file extension")
+
+def _resolve_gradio_file_to_path(infile) -> str:
+    """
+    Gradio versions vary:
+    - may pass a tempfile object with .name
+    - may pass a dict-like with 'path'
+    - may pass a plain string path
+    """
+    if infile is None:
+        raise ValueError("No input file provided.")
+    if isinstance(infile, str):
+        return infile
+    if hasattr(infile, "name") and isinstance(infile.name, str):
+        return infile.name
+    if isinstance(infile, dict) and "path" in infile:
+        return str(infile["path"])
+    # last resort: try attribute 'path'
+    if hasattr(infile, "path"):
+        return str(infile.path)
+    raise ValueError(f"Unsupported infile type: {type(infile)}")
 
 
-def puretfidfdocs(docs: List[str], maxfeatures: int = 8000) -> Tuple[np.ndarray, List[str]]:
-    allwords = set()
-    for doc in docs:
-        allwords.update(re.findall(r"\w+", (doc or "").lower()))
-    vocab = list(allwords)[: maxfeatures]
-    wordtoidx = {w: i for i, w in enumerate(vocab)}
-    X = np.zeros((len(docs), len(vocab)), dtype=np.float32)
-
-    for i, doc in enumerate(docs):
-        wc: Dict[str, int] = {}
-        for w in re.findall(r"\w+", (doc or "").lower()):
-            wc[w] = wc.get(w, 0) + 1
-        if not wc:
-            continue
-        uniq = max(1, len(wc))
-        for w, c in wc.items():
-            j = wordtoidx.get(w, None)
-            if j is None:
-                continue
-            tf = c / uniq
-            df = sum(1 for d in docs if w in (d or "").lower())
-            idf = math.log(len(docs) / (1 + df))
-            X[i, j] = tf * idf
-    return X, vocab
-
-
-def puretruncatedsvd(X: np.ndarray, ncomponents: int, randomstate: int = 42) -> Any:
-    np.random.seed(int(randomstate))
-    m, n = X.shape
-    k = int(min(ncomponents, min(m, n)))
-    if k <= 1:
-        return type("SVD", (), {"components": np.zeros((0, n), dtype=np.float32)})
-
-    Q = np.random.randn(n, k).astype(np.float32)
-    Q, _ = np.linalg.qr(Q)
-    for _ in range(8):
-        B = X.T @ X @ Q
-        Q, _ = np.linalg.qr(B)
-    B = X @ Q
-    _U, _S, Vt = np.linalg.svd(B, full_matrices=False)
-    comps = Vt[:k].astype(np.float32)
-    return type("SVD", (), {"components": comps})
-
-
-def tokenclasstok(tok: str) -> str:
-    if tok in PUNCT:
-        return "PUNC"
-    t = (tok or "").lower()
-    if not re.match(r"^[a-z]", t):
-        return "OTHER"
-    L = len(t)
-    return "S" if L <= 3 else ("M" if L <= 7 else "L")
-
-
-# =============================================================================
-# Graph signature
-# =============================================================================
+# ----------------------------
+# Graph Components
+# ----------------------------
 
 @dataclass
 class SimpleGraph:
@@ -165,184 +182,188 @@ class SimpleGraph:
     edges: List[Tuple[int, int, Dict[str, Any]]]
 
     @classmethod
-    def fromtokensequence(cls, tokens: List[str], maxnodes: int = 220):
-        toks = (tokens or [])[: maxnodes]
-        nodes = [{"id": i, "cls": tokenclasstok(t)} for i, t in enumerate(toks)]
-        edges: List[Tuple[int, int, Dict[str, Any]]] = []
+    def from_token_sequence(cls, tokens: List[str], max_nodes: int = 220):
+        toks = tokens[:max_nodes]
+        nodes = [{"id": i, "cls": _token_class(t)} for i, t in enumerate(toks)]
+        edges = []
         for i in range(len(toks) - 1):
             edges.append((i, i + 1, {"rel": "adj"}))
         for i in range(len(toks) - 2):
             edges.append((i, i + 2, {"rel": "skip"}))
         return cls(nodes, edges)
 
-    def degreehistogram(self, maxbins: int = 16) -> np.ndarray:
-        degrees = np.zeros((maxbins,), dtype=np.int32)
-        nodedeg = {node["id"]: 0 for node in self.nodes}
+    def degree_histogram(self, max_bins: int = 16) -> np.ndarray:
+        degrees = [0] * max_bins
+        node_deg = {node["id"]: 0 for node in self.nodes}
         for u, v, _ in self.edges:
-            nodedeg[u] += 1
-            nodedeg[v] += 1
-        for d in nodedeg.values():
-            if 0 <= d < maxbins:
+            node_deg[u] += 1
+            node_deg[v] += 1
+        for d in node_deg.values():
+            if d < max_bins:
                 degrees[d] += 1
-        return degrees
+        return np.array(degrees)
 
-    def weisfeilerlehmanhash(self, iterations: int = 3, digestsize: int = 16) -> str:
+    def weisfeiler_lehman_hash(self, iterations: int = 3, digest_size: int = 16) -> str:
         labels = {node["id"]: node["cls"] for node in self.nodes}
         adj = {node["id"]: [] for node in self.nodes}
         for u, v, _ in self.edges:
             adj[u].append(v)
             adj[v].append(u)
 
-        for _ in range(int(iterations)):
-            newlabels = {}
-            for nodeid in labels:
-                neighbors = sorted(labels[n] for n in adj[nodeid])
-                combined = (labels[nodeid], tuple(neighbors))
-                newhash = hash(combined) % (10 ** int(digestsize))
-                newlabels[nodeid] = f"{labels[nodeid]}{newhash}"
-            labels = newlabels
+        for _ in range(iterations):
+            new_labels = {}
+            for node_id in labels:
+                neighbors = sorted([labels[n] for n in adj[node_id]])
+                combined = (labels[node_id],) + tuple(neighbors)
+                new_hash = hash(combined) % (10**digest_size)
+                new_labels[node_id] = f"{labels[node_id]}_{new_hash}"
+            labels = new_labels
 
-        finalhash = sum(hash(k) + hash(labels[k]) for k in labels) % (10 ** int(digestsize))
-        return f"{finalhash:0{int(digestsize)}}"
+        final_hash = sum(hash((k, labels[k])) for k in labels) % (10**digest_size)
+        return f"{final_hash:0{digest_size}d}"
 
-    def automorphismestimate(self, maxcount: int = 150) -> int:
-        counts: Dict[str, int] = {}
-        for node in self.nodes:
-            c = node["cls"]
-            counts[c] = counts.get(c, 0) + 1
+    def automorphism_estimate(self, max_count: int = 150) -> int:
+        labels = {node["id"]: node["cls"] for node in self.nodes}
+        counts = {}
+        for l in labels.values():
+            counts[l] = counts.get(l, 0) + 1
         prod = 1
-        for v in counts.values():
-            prod *= v
-        return min(int(maxcount), int(prod))
+        for c in counts.values():
+            prod *= c
+        return min(max_count, prod)
 
-
-def graphsignature(G: SimpleGraph) -> Dict[str, object]:
+def graph_signature(G: SimpleGraph) -> Dict[str, object]:
     return {
-        "deghist": G.degreehistogram(),
-        "wl": G.weisfeilerlehmanhash(),
-        "autest": G.automorphismestimate(),
+        "deg_hist": G.degree_histogram(),
+        "wl": G.weisfeiler_lehman_hash(),
+        "aut_est": G.automorphism_estimate(),
     }
 
-
-# =============================================================================
-# Fuzzy logic (FIXED membership endpoints)
-# =============================================================================
-
-def mftrix(x: torch.Tensor, a: float, b: float, c: float) -> torch.Tensor:
-    # triangle: 0 at <=a and >=c, 1 at b
-    x = x.to(dtype=torch.float32)
-    y = torch.zeros_like(x)
-
-    # rising edge (a->b)
-    if b > a:
-        y = torch.where((x > a) & (x < b), (x - a) / (b - a), y)
-
-    # falling edge (b->c)
-    if c > b:
-        y = torch.where((x >= b) & (x < c), torch.maximum(y, (c - x) / (c - b)), y)
-
-    # peak
-    y = torch.where(x == b, torch.ones_like(x), y)
-    return y.clamp(0.0, 1.0)
+def passes_automorphism_checks(ref_sig, out_sig, geometric_strength: float = 0.3) -> bool:
+    strict = max(0.0, min(2.0, geometric_strength))
+    ref = ref_sig["deg_hist"].astype(float)
+    ref = ref / (ref.sum() + 1e-12)
+    out = out_sig["deg_hist"].astype(float)
+    out = out / (out.sum() + 1e-12)
+    if np.abs(ref - out).sum() > max(0.25, 1.10 - 0.35 * strict):
+        return False
+    ratio = max(1, out_sig["aut_est"]) / max(1, ref_sig["aut_est"])
+    band = max(1.3, 3.5 - 1.2 * min(1.0, strict / 2.0))
+    if not (1.0 / band <= ratio <= band):
+        return False
+    if strict >= 1.6 and out_sig["wl"] != ref_sig["wl"]:
+        return False
+    return True
 
 
-def mftrap(x: torch.Tensor, a: float, b: float, c: float, d: float) -> torch.Tensor:
-    # trapezoid: 0 <=a, rises to 1 at b, plateau b..c, falls to 0 at d
-    # handles shoulders a==b and/or c==d correctly (important for your controller).
-    x = x.to(dtype=torch.float32)
-    y = torch.zeros_like(x)
+# ----------------------------
+# Fuzzy Logic Controller (Sugeno)
+# ----------------------------
 
-    # plateau (inclusive)
-    y = torch.where((x >= b) & (x <= c), torch.ones_like(x), y)
+def mf_tri(x: torch.Tensor, a: float, b: float, c: float) -> torch.Tensor:
+    x = x.clamp(min=min(a, c), max=max(a, c))
+    left = (x - a) / max(1e-9, (b - a))
+    right = (c - x) / max(1e-9, (c - b))
+    return torch.clamp(torch.minimum(left, right), 0.0, 1.0)
 
-    # rising edge (a->b)
-    if b > a:
-        y = torch.where((x > a) & (x < b), torch.maximum(y, (x - a) / (b - a)), y)
-    else:
-        # left shoulder (a==b): jump to 1 at x>=b
-        y = torch.where(x >= b, torch.maximum(y, torch.ones_like(x)), y)
+def mf_trap(x: torch.Tensor, a: float, b: float, c: float, d: float) -> torch.Tensor:
+    x = x.clamp(min=min(a, d), max=max(a, d))
+    up = (x - a) / max(1e-9, (b - a))
+    down = (d - x) / max(1e-9, (d - c))
+    one = torch.tensor(1.0, device=x.device, dtype=x.dtype)
+    return torch.clamp(torch.minimum(torch.minimum(up, one), down), 0.0, 1.0)
 
-    # falling edge (c->d)
-    if d > c:
-        y = torch.where((x > c) & (x < d), torch.maximum(y, (d - x) / (d - c)), y)
-    else:
-        # right shoulder (c==d): stay 1 until c, then 0 after d; plateau already set
-        y = y
-
-    # outside support
-    y = torch.where(x <= a, torch.zeros_like(x), y)
-    y = torch.where(x >= d, torch.zeros_like(x), y)
-    return y.clamp(0.0, 1.0)
-
-
-def tnormprod(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+def tnorm_prod(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return a * b
 
-
-def snormmax(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+def snorm_max(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return torch.maximum(a, b)
 
-
 class FuzzyWeightController(nn.Module):
+    """
+    Serial fuzzy logic gates producing a gain g in [0,1].
+    Sugeno defuzzification: weighted average of constant consequents.
+    """
     def __init__(self):
         super().__init__()
-        self.zlow = 0.20
-        self.zmid = 0.55
-        self.zhigh = 0.95
+        self.z_low = 0.20
+        self.z_mid = 0.55
+        self.z_high = 0.95
 
+    @torch.no_grad()
     def forward(self, entropy01: torch.Tensor, peak01: torch.Tensor, boost01: torch.Tensor) -> torch.Tensor:
         e = entropy01.clamp(0, 1)
         p = peak01.clamp(0, 1)
         b = boost01.clamp(0, 1)
 
-        elow = mftrap(e, 0.0, 0.0, 0.25, 0.45)
-        emid = mftrix(e, 0.25, 0.50, 0.75)
-        ehigh = mftrap(e, 0.55, 0.75, 1.0, 1.0)
+        # Memberships
+        e_low  = mf_trap(e, 0.0, 0.0, 0.25, 0.45)
+        e_mid  = mf_tri(e, 0.25, 0.50, 0.75)
+        e_high = mf_trap(e, 0.55, 0.75, 1.0, 1.0)
 
-        plow = mftrap(p, 0.0, 0.0, 0.20, 0.40)
-        pmid = mftrix(p, 0.25, 0.50, 0.75)
-        phigh = mftrap(p, 0.60, 0.80, 1.0, 1.0)
+        p_low  = mf_trap(p, 0.0, 0.0, 0.20, 0.40)
+        p_mid  = mf_tri(p, 0.25, 0.50, 0.75)
+        p_high = mf_trap(p, 0.60, 0.80, 1.0, 1.0)
 
-        blow = mftrap(b, 0.0, 0.0, 0.20, 0.45)
-        bmid = mftrix(b, 0.25, 0.50, 0.75)
-        bhigh = mftrap(b, 0.55, 0.80, 1.0, 1.0)
+        b_low  = mf_trap(b, 0.0, 0.0, 0.20, 0.45)
+        b_mid  = mf_tri(b, 0.25, 0.50, 0.75)
+        b_high = mf_trap(b, 0.55, 0.80, 1.0, 1.0)
 
-        w1 = tnormprod(ehigh, plow)   # explore
-        w2 = tnormprod(emid, bmid)    # balanced
-        w3 = snormmax(phigh, bhigh)   # confident/steered
-        w4 = tnormprod(elow, pmid)    # stable
+        # Rules
+        # R1: High entropy AND Low peak -> High Gain (explore)
+        w1 = tnorm_prod(e_high, p_low)
+        # R2: Mid entropy AND Mid boost -> Mid Gain
+        w2 = tnorm_prod(e_mid, b_mid)
+        # R3: High peak OR High boost -> Low Gain (confident/already steered)
+        w3 = snorm_max(p_high, b_high)
+        # R4: Low entropy AND Mid peak -> Low Gain (stable)
+        w4 = tnorm_prod(e_low, p_mid)
 
-        Z = torch.tensor([self.zhigh, self.zmid, self.zlow, self.zlow], device=e.device, dtype=torch.float32)
-        W = torch.stack([w1, w2, w3, w4]).to(dtype=torch.float32).clamp(min=0.0)
-        g = (W @ Z) / (W.sum() + 1e-12)
+        Z = torch.tensor([self.z_high, self.z_mid, self.z_low, self.z_low], device=e.device, dtype=torch.float32)
+        W = torch.stack([w1, w2, w3, w4]).to(dtype=torch.float32).clamp_min(0.0)
+
+        g = (W * Z).sum() / (W.sum() + 1e-12)
         return g.clamp(0.0, 1.0)
 
 
+# ----------------------------
+# Neural Modules (Lateral Inhibition only)
+# ----------------------------
+
 class LateralInhibition(nn.Module):
-    def __init__(self, strength=0.5):
+    def __init__(self, kernel_size=7, strength=0.5):
         super().__init__()
         self.strength = float(strength)
         k = torch.tensor([-0.95, -0.9, -0.1, 0.3, -1.4, -1.2, -1.05], dtype=torch.float32)
         self.register_buffer("kernel", k.view(1, 1, -1))
-        self.pad = 3
+        self.pad = int(kernel_size // 2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() == 1:
             x = x.view(1, 1, -1)
         elif x.dim() == 2:
             x = x.view(x.shape[0], 1, x.shape[1])
-        mod = F.conv1d(x, self.kernel, padding=self.pad)
-        out = F.relu(x + self.strength * mod)
+        modulation = F.conv1d(x, self.kernel, padding=self.pad)
+        out = x + self.strength * modulation
+        out = F.relu(out)
         return out / (out.sum(dim=-1, keepdim=True) + 1e-12)
 
+class SynapticPruner(nn.Module):
+    def __init__(self, n_features: int):
+        super().__init__()
+        self.gain = nn.Parameter(torch.ones(int(n_features)))
 
-# =============================================================================
-# LM
-# =============================================================================
+    def forward(self, W: torch.Tensor) -> torch.Tensor:
+        return W * self.gain.view(1, -1)
+
+
+# ----------------------------
+# Quadgram LM
+# ----------------------------
 
 class QuadgramLM:
-    def __init__(self, addk: float = 0.25):
-        self.addk = float(addk)
+    def __init__(self, add_k: float = 0.25):
+        self.add_k = float(add_k)
         self.uni: Dict[str, int] = {}
         self.bi: Dict[Tuple[str, str], int] = {}
         self.tri: Dict[Tuple[str, str, str], int] = {}
@@ -356,44 +377,38 @@ class QuadgramLM:
         self.tri.clear()
         self.quad.clear()
         self.total = 0
-
-        toks = tokens or []
-        for t in toks:
+        for t in tokens:
             self.uni[t] = self.uni.get(t, 0) + 1
             self.total += 1
-
-        for i in range(len(toks) - 1):
-            k = (toks[i], toks[i + 1])
+        for i in range(len(tokens) - 1):
+            k = (tokens[i], tokens[i + 1])
             self.bi[k] = self.bi.get(k, 0) + 1
-
-        for i in range(len(toks) - 2):
-            k = (toks[i], toks[i + 1], toks[i + 2])
+        for i in range(len(tokens) - 2):
+            k = (tokens[i], tokens[i + 1], tokens[i + 2])
             self.tri[k] = self.tri.get(k, 0) + 1
-
-        for i in range(len(toks) - 3):
-            k = (toks[i], toks[i + 1], toks[i + 2], toks[i + 3])
+        for i in range(len(tokens) - 3):
+            k = (tokens[i], tokens[i + 1], tokens[i + 2], tokens[i + 3])
             self.quad[k] = self.quad.get(k, 0) + 1
-
         self.vocab = list(self.uni.keys())
 
-    def nextdistribution(self, w1: str, w2: str, w3: str) -> Tuple[List[str], torch.Tensor]:
-        cont: List[str] = []
-        for (a, b, c, d), _cnt in self.quad.items():
+    def next_distribution(self, w1: str, w2: str, w3: str) -> Tuple[List[str], torch.Tensor]:
+        cont = []
+        for (a, b, c, d), count in self.quad.items():
             if a == w1 and b == w2 and c == w3:
                 cont.append(d)
         if not cont:
-            for (a, b, c), _cnt in self.tri.items():
+            for (a, b, c), count in self.tri.items():
                 if a == w2 and b == w3:
                     cont.append(c)
         if not cont:
-            for (a, b), _cnt in self.bi.items():
+            for (a, b), count in self.bi.items():
                 if a == w3:
                     cont.append(b)
         if not cont:
             cont = [w for w, _ in sorted(self.uni.items(), key=lambda x: x[1], reverse=True)[:200]]
 
         seen = set()
-        cand: List[str] = []
+        cand = []
         for w in cont:
             if w not in seen:
                 seen.add(w)
@@ -401,55 +416,50 @@ class QuadgramLM:
         cand = cand[:500]
 
         V = len(self.vocab) + 1
-        addk = self.addk
+        add_k = self.add_k
 
-        def getprob(w4: str) -> float:
+        def get_prob(w4: str) -> float:
             c123 = self.tri.get((w1, w2, w3), 0)
             c1234 = self.quad.get((w1, w2, w3, w4), 0)
             if c123 > 0:
-                return (c1234 + addk) / (c123 + addk * V)
-
+                return (c1234 + add_k) / (c123 + add_k * V)
             c12 = self.bi.get((w2, w3), 0)
-            c123tri = self.tri.get((w2, w3, w4), 0)
+            c123_tri = self.tri.get((w2, w3, w4), 0)
             if c12 > 0:
-                return (c123tri + addk) / (c12 + addk * V)
-
+                return (c123_tri + add_k) / (c12 + add_k * V)
             c1 = self.uni.get(w3, 0)
-            c12bi = self.bi.get((w3, w4), 0)
+            c12_bi = self.bi.get((w3, w4), 0)
             if c1 > 0:
-                return (c12bi + addk) / (c1 + addk * V)
+                return (c12_bi + add_k) / (c1 + add_k * V)
+            return (self.uni.get(w4, 0) + add_k) / (self.total + add_k * V)
 
-            return (self.uni.get(w4, 0) + addk) / (self.total + addk * V)
-
-        probs = torch.tensor([getprob(w) for w in cand], dtype=torch.float32)
+        probs = torch.tensor([get_prob(w) for w in cand], dtype=torch.float32)
         probs = probs / (probs.sum() + 1e-12)
         return cand, probs
 
 
-# =============================================================================
-# State objects
-# =============================================================================
+# ----------------------------
+# System State
+# ----------------------------
 
 @dataclass
 class Nodelet:
     idx: int
-    topterms: List[Tuple[str, float]]
+    top_terms: List[Tuple[str, float]]
     energy: float
     narrative: str
-
 
 @dataclass
 class ModelState:
     nodelets: List[Nodelet]
     vocab100: List[str]
-    bindingW: torch.Tensor
-    barprobs: torch.Tensor
-    tokenboost: Dict[str, float]
-    pillarweights: torch.Tensor
-    geometricbias: torch.Tensor
-    semanticgraph: SimpleGraph
-    lmgraph: Any
-
+    binding_W: torch.Tensor
+    bar_probs: torch.Tensor
+    token_boost: Dict[str, float]
+    pillar_weights: torch.Tensor
+    geometric_bias: torch.Tensor
+    semantic_graph: SimpleGraph
+    lm_graph: Any
 
 @dataclass
 class PreparedCorpus:
@@ -457,772 +467,560 @@ class PreparedCorpus:
     tokens: List[str]
     lm: QuadgramLM
     state: ModelState
-    refsig: Dict[str, object]
-
+    ref_sig: Dict[str, object]
 
 class RadixLRUCache:
-    def __init__(self, maxitems: int = 25000):
-        self.maxitems = int(max(256, maxitems))
-        self.od = OrderedDict()
+    def __init__(self, max_items: int = 25000):
+        self.max_items = int(max(256, max_items))
+        self._od = OrderedDict()
 
     def get(self, key):
-        v = self.od.get(key, None)
-        if v is not None:
-            self.od.move_to_end(key)
+        v = self._od.get(key, None)
+        if v is None:
+            return None
+        self._od.move_to_end(key)
         return v
 
     def put(self, key, value):
-        self.od[key] = value
-        self.od.move_to_end(key)
-        if len(self.od) > self.maxitems:
-            self.od.popitem(last=False)
+        self._od[key] = value
+        self._od.move_to_end(key)
+        if len(self._od) > self.max_items:
+            self._od.popitem(last=False)
 
     def clear(self):
-        self.od.clear()
+        self._od.clear()
 
 
-# =============================================================================
-# Main generator (now actually trainable)
-# =============================================================================
+# ----------------------------
+# NeuroSymbolicGraphGenerator
+# ----------------------------
 
-class NeuroSymbolicGraphGenerator(nn.Module):
+class NeuroSymbolicGraphGenerator:
     def __init__(
         self,
-        nodeletsn=10,
-        barsn=100,
-        svdrandomstate=7,
-        softmaxtemp=0.85,
-        steerstrength=1.35,
-        lmaddk=0.25,
-        focusstrength=0.5,
-        radixcacheitems=25000,
+        nodelets_n: int = 10,
+        bars_n: int = 100,
+        svd_random_state: int = 7,
+        softmax_temp: float = 0.85,
+        steer_strength: float = 1.35,
+        lm_add_k: float = 0.25,
+        pillar_strength: float = 0.85,
+        geometric_strength: float = 0.3,
+        rfe_enabled: bool = True,
+        rfe_iterations: int = 3,
+        rfe_removal_rate: float = 0.15,
+        focus_strength: float = 0.5,
+        radix_cache_items: int = 25000,
     ):
-        super().__init__()
-        self.nodeletsn = int(nodeletsn)
-        self.barsn = int(barsn)
-        self.svdrandomstate = int(svdrandomstate)
-        self.softmaxtemp = float(softmaxtemp)
-        self.lmaddk = float(lmaddk)
-        self.basesteer = float(steerstrength)
-        self.basetemp = float(softmaxtemp)
+        self.nodelets_n = int(nodelets_n)
+        self.bars_n = int(bars_n)
+        self.svd_random_state = int(svd_random_state)
+        self.softmax_temp = float(softmax_temp)
+        self.lm_add_k = float(lm_add_k)
+        self.pillar_strength = float(pillar_strength)
+        self.geometric_strength = float(geometric_strength)
+        self.rfe_enabled = bool(rfe_enabled)
+        self.rfe_iterations = int(rfe_iterations)
+        self.rfe_removal_rate = float(rfe_removal_rate)
 
-        self.focuslayer = LateralInhibition(strength=float(focusstrength))
-        self.fuzzyctl = FuzzyWeightController()
+        self.base_steer = float(steer_strength)
+        self.base_temp = float(softmax_temp)
 
-        self.cacheversion = 0
-        self.radixcache = RadixLRUCache(maxitems=int(radixcacheitems))
+        self.focus_layer = LateralInhibition(strength=float(focus_strength))
+        self.fuzzy_ctl = FuzzyWeightController()
 
-        # Trainable scalars (prevents backward() crash and lets "Train" do something).
-        self.steer_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
-        self.temp_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
-        self.boost_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+        self.pruner: Optional[SynapticPruner] = None
+        self.cache_version = 0
+        self.radix_cache = RadixLRUCache(max_items=int(radix_cache_items))
 
-    def bumpcacheversion(self):
-        self.cacheversion += 1
-        self.radixcache.clear()
+    def bump_cache_version(self):
+        self.cache_version += 1
+        self.radix_cache.clear()
 
-    def pickinitialcontext(self, lm: QuadgramLM, seedwords: List[str]) -> Tuple[str, str, str]:
-        sw = [t for t in (seedwords or []) if re.match(r"^[a-z0-9-]+$", t)]
+    def _pick_initial_context(self, lm: QuadgramLM, seed_words: List[str]) -> Tuple[str, str, str]:
+        sw = [t for t in seed_words if re.match(r"^[a-z][a-z0-9_\-']*$", t)]
         if len(sw) >= 3:
-            return sw[-3], sw[-2], sw[-1]
+            return (sw[-3], sw[-2], sw[-1])
         if len(sw) == 2:
-            return sw[0], sw[1], sw[1]
+            return (sw[-2], sw[-1], sw[-1])
         if len(sw) == 1:
-            return sw[0], sw[0], sw[0]
-        seedtok = lm.vocab[0] if lm.vocab else "the"
-        return seedtok, seedtok, seedtok
+            return (sw[-1], sw[-1], sw[-1])
+        seed_tok = lm.vocab[0] if lm.vocab else "the"
+        return (seed_tok, seed_tok, seed_tok)
 
-    def buildstate(self, text: str) -> ModelState:
-        text = normalizetext(text)
-        docs = re.split(r"\.\s+", text)[:500]
-        X, vocab = puretfidfdocs(docs, maxfeatures=8000)
+    def _build_token_structure_graph(self, tokens: List[str], max_nodes: int = 220) -> SimpleGraph:
+        return SimpleGraph.from_token_sequence(tokens, max_nodes)
 
-        if X.size == 0 or not vocab:
+    def _graph_signature(self, G: SimpleGraph) -> Dict[str, object]:
+        return graph_signature(G)
+
+    def _synaptic_prune(self, W: torch.Tensor, energies: torch.Tensor, vocab100: List[str], progress=None):
+        if not self.rfe_enabled or self.rfe_iterations <= 0:
+            return W, vocab100
+        k, bars_n = W.shape
+        self.pruner = SynapticPruner(bars_n)
+        W_curr = W.detach().clone().requires_grad_(True)
+        kept_mask = torch.ones(bars_n, dtype=torch.bool)
+
+        for iteration in range(self.rfe_iterations):
+            if progress:
+                progress(0.80 + 0.05 * (iteration / max(1, self.rfe_iterations)), desc=f"Synaptic Pruning {iteration+1}")
+            W_modulated = self.pruner(W_curr)
+            var_term = 0.0
+            if W_modulated.size(0) >= 2:
+                var_term = torch.var(W_modulated, dim=0, correction=1).sum()
+
+            loss = -torch.sum(W_modulated * energies.view(-1, 1)) + 0.1 * var_term
+            loss.backward()
+            with torch.no_grad():
+                grads = W_curr.grad.abs().sum(dim=0)
+                weights = W_curr.abs().sum(dim=0)
+                importance = 0.6 * weights + 0.4 * grads
+                importance = importance / (importance.max() + 1e-12)
+                n_keep = int(kept_mask.sum().item() * (1.0 - self.rfe_removal_rate))
+                if n_keep < 10:
+                    break
+                active = torch.where(kept_mask)[0]
+                local_importance = importance[active]
+                _, top_local = torch.topk(local_importance, k=min(n_keep, local_importance.numel()))
+                new_mask = torch.zeros_like(kept_mask)
+                new_mask[active[top_local]] = True
+                kept_mask = new_mask
+                W_curr.grad.zero_()
+
+        with torch.no_grad():
+            final_idx = torch.where(kept_mask)[0]
+            W_final = W[:, final_idx]
+            vocab_final = [vocab100[i] for i in final_idx.tolist()]
+        return W_final, vocab_final
+
+    def build_state(self, text: str, progress=None) -> ModelState:
+        if progress:
+            progress(0, desc="Normalizing")
+        text = normalize(text)
+        docs = re.split(r"\n\s*\n", text)[:500]
+        X, vocab = pure_tfidf(docs, max_features=8000)
+
+        if X.size == 0 or len(vocab) == 0:
             vocab100 = ["the", "is", "a"]
             probs = torch.tensor([0.34, 0.33, 0.33], dtype=torch.float32)
             return ModelState([], vocab100, torch.zeros(0, 3), probs, {}, torch.zeros_like(probs), torch.zeros_like(probs), SimpleGraph([], []), None)
 
-        topidx = np.argsort(-X.sum(axis=0))[: self.barsn]
-        vocab100 = [vocab[i] for i in topidx]
-        Xsvd = X[:, topidx]
+        top_idx = np.argsort(-X.sum(axis=0))[: self.bars_n]
+        vocab100 = [vocab[i] for i in top_idx]
+        X_svd = X[:, top_idx]
 
-        nrows, ncols = Xsvd.shape
-        maxrank = min(nrows, ncols)
-        k = 1 if maxrank <= 1 else min(self.nodeletsn, maxrank, 10)
+        n_rows, n_cols = X_svd.shape
+        max_rank = min(n_rows, n_cols)
+        k = 1 if max_rank <= 1 else min(self.nodelets_n, max_rank, 10)
 
-        svd = puretruncatedsvd(Xsvd, ncomponents=k, randomstate=self.svdrandomstate)
-        nodelets: List[Nodelet] = []
-        for i, comp in enumerate(svd.components):
+        svd = pure_truncated_svd(X_svd, n_components=k, random_state=self.svd_random_state)
+
+        nodelets = []
+        for i, comp in enumerate(svd.components_):
             terms = sorted([(vocab100[j], float(comp[j])) for j in range(len(comp))], key=lambda x: -abs(x[1]))[:10]
             eng = float(np.linalg.norm(comp))
             nodelets.append(Nodelet(i, terms, eng, f"Nodelet {i}"))
 
-        W = torch.tensor(svd.components, dtype=torch.float32)
+        W = torch.tensor(svd.components_, dtype=torch.float32)
         W = F.relu(W)
         if W.numel() > 0:
             W = W / (W.max(dim=1, keepdim=True)[0] + 1e-12)
 
-        energies = torch.tensor([n.energy for n in nodelets], dtype=torch.float32)
-        if energies.numel() > 0:
-            energies = energies / (energies.max() + 1e-12)
+        energies = torch.tensor([n.energy for n in nodelets], dtype=torch.float32) if nodelets else torch.ones(1)
+        energies = energies / (energies.max() + 1e-12)
 
-        if W.numel() == 0 or energies.numel() == 0:
-            probs = torch.ones(len(vocab100), dtype=torch.float32)
-            probs = probs / (probs.sum() + 1e-12)
+        if W.numel() > 0:
+            W, vocab100 = self._synaptic_prune(W, energies, vocab100, progress)
+            logits = (energies.view(-1, 1) * W).sum(dim=0)
+            probs = F.softmax(logits / max(self.softmax_temp, 1e-6), dim=-1)
+            probs = self.focus_layer(probs.view(1, 1, -1)).squeeze(0).squeeze(0)
         else:
-            logits = energies.view(-1, 1) @ W.sum(dim=0).view(1, -1)
-            probs = F.softmax(logits / max(self.softmaxtemp, 1e-6), dim=-1)
-            probs = self.focuslayer(probs.view(1, 1, -1)).squeeze(0).squeeze(0)
+            probs = torch.ones(len(vocab100), dtype=torch.float32) / max(1, len(vocab100))
 
-        tokenboost: Dict[str, float] = {}
+        token_boost = {}
         for w, p in zip(vocab100, probs.detach().cpu().tolist()):
             for subw in w.split():
-                if len(subw) >= 2 and subw not in STOPWORDS:
-                    tokenboost[subw] = max(tokenboost.get(subw, 0.0), math.log(p + 1e-12) * 5.0)
+                if len(subw) > 2 and subw not in STOP_WORDS:
+                    token_boost[subw] = max(token_boost.get(subw, 0.0), math.log(p + 1e-12) + 5.0)
 
-        return ModelState(nodelets, vocab100, W, probs, tokenboost, torch.zeros_like(probs), torch.zeros_like(probs), SimpleGraph([], []), None)
+        return ModelState(nodelets, vocab100, W, probs, token_boost, torch.zeros_like(probs), torch.zeros_like(probs), SimpleGraph([], []), None)
 
-    def preparecorpus(self, text: str) -> PreparedCorpus:
-        text = normalizetext(text)
-        state = self.buildstate(text)
-        tokens = basictokenize(text)
-        lm = QuadgramLM(self.lmaddk)
+    def prepare_corpus(self, text: str, progress=None) -> PreparedCorpus:
+        text = normalize(text)
+        state = self.build_state(text, progress)
+        tokens = basic_tokenize(text)
+        lm = QuadgramLM(self.lm_add_k)
         lm.ingest(tokens)
-        G = SimpleGraph.fromtokensequence(tokens, maxnodes=220)
-        refsig = graphsignature(G)
-        return PreparedCorpus(text, tokens, lm, state, refsig)
+        G = self._build_token_structure_graph(tokens)
+        ref_sig = self._graph_signature(G)
+        return PreparedCorpus(text, tokens, lm, state, ref_sig)
 
-    def finalprobsforcontextcached(self, prep: PreparedCorpus, w1: str, w2: str, w3: str) -> Tuple[List[str], torch.Tensor, float]:
-        key = (int(self.cacheversion), str(w1), str(w2), str(w3))
+    def _final_probs_for_context_cached(self, prep: PreparedCorpus, w1: str, w2: str, w3: str) -> Tuple[List[str], torch.Tensor, float]:
+        key = (int(self.cache_version), str(w1), str(w2), str(w3))
+        cached = self.radix_cache.get(key)
+        if cached is not None:
+            return cached
 
-        # IMPORTANT: cache only in eval mode; training must not detach/cached.
-        if not self.training:
-            cached = self.radixcache.get(key)
-            if cached is not None:
-                return cached
-
-        cand, baseprobs = prep.lm.nextdistribution(w1, w2, w3)
+        cand, base_probs = prep.lm.next_distribution(w1, w2, w3)
         if not cand:
-            cand = prep.lm.vocab if prep.lm.vocab else ["the", "is", "a"]
-            basep = torch.ones(len(cand), dtype=torch.float32)
-            basep = basep / max(1, len(cand))
+            cand = prep.lm.vocab[:100] if prep.lm.vocab else ["the", "is", "a"]
+            base_p = torch.ones(len(cand), dtype=torch.float32) / max(1, len(cand))
         else:
-            basep = baseprobs.clone().to(dtype=torch.float32).view(-1)
-            basep = basep / (basep.sum() + 1e-12)
-            basep = self.focuslayer(basep.view(1, 1, -1)).squeeze(0).squeeze(0)
+            base_p = base_probs.detach().clone().to(dtype=torch.float32)
+            if base_p.numel() != len(cand):
+                base_p = torch.ones(len(cand), dtype=torch.float32) / max(1, len(cand))
 
-        val = basep.clamp(min=1e-12)
-        H = -torch.sum(basep * torch.log(val))
-        V = float(basep.numel())
-        denom = max(1e-9, math.log(max(2.0, V)))
-        entropy01 = (H / denom).clamp(0.0, 1.0)
-        peak01 = basep.max().clamp(0.0, 1.0)
+        base_p = base_p.view(-1)
+        base_p = base_p / (base_p.sum() + 1e-12)
+        base_p = self.focus_layer(base_p.view(1, 1, -1)).squeeze(0).squeeze(0)
 
-        boosts = torch.tensor([prep.state.tokenboost.get(w, 0.0) for w in cand], dtype=torch.float32).view(-1)
-        boost01 = (torch.tanh(boosts.abs()).mean() / 3.0).clamp(0.0, 1.0)
+        # Fuzzy Feature Extraction
+        # 1. Entropy (normalized)
+        val = base_p.clamp_min(1e-12)
+        H = -torch.sum(base_p * torch.log(val))
+        V = float(base_p.numel())
+        entropy01 = (H / max(1e-9, math.log(max(2.0, V)))).clamp(0.0, 1.0)
 
-        g = self.fuzzyctl(entropy01, peak01, boost01)  # tensor
+        # 2. Peak prob
+        peak01 = base_p.max().clamp(0.0, 1.0)
 
-        # Trainable scaling
-        steer_scale = torch.clamp(self.steer_scale, 0.0, 10.0)
-        temp_scale = torch.clamp(self.temp_scale, 0.05, 10.0)
-        boost_scale = torch.clamp(self.boost_scale, 0.0, 10.0)
+        # 3. Boost magnitude
+        boosts = torch.tensor([prep.state.token_boost.get(w, 0.0) for w in cand], dtype=torch.float32).view(-1)
+        boost01 = torch.tanh(boosts.abs().mean() / 3.0).clamp(0.0, 1.0)
 
-        effectivesteer = (self.basesteer * steer_scale) * g
-        effectivetemp = (self.basetemp * temp_scale) * (1.2 - 0.7 * g)
+        # Fuzzy Logic Control
+        g = self.fuzzy_ctl(entropy01, peak01, boost01)
 
-        potentials = torch.log(basep.clamp(min=1e-12)) + effectivesteer * (boost_scale * boosts)
-        potentials = potentials / effectivetemp.clamp(min=1e-6)
-        finalprobs = F.softmax(potentials, dim=-1)
+        # Apply fuzzy gain
+        effective_steer = self.base_steer * float(g.item())
+        effective_temp = self.base_temp * (1.2 - 0.7 * float(g.item()))
 
-        g_float = float(g.detach().item())
+        potentials = torch.log(base_p.clamp_min(1e-12)) + effective_steer * boosts
+        potentials = potentials / max(effective_temp, 1e-6)
+        final_probs = F.softmax(potentials, dim=-1)
 
-        if not self.training:
-            result = (cand, finalprobs.detach(), g_float)
-            self.radixcache.put(key, result)
-            return result
-
-        return (cand, finalprobs, g_float)
-
-
-# =============================================================================
-# Dataset + sentence splitting + inference point extraction
-# =============================================================================
-
-@dataclass
-class TextSample:
-    text: str
-    tokens: List[str]
-    split: str
+        result = (cand, final_probs.detach(), float(g.item()))
+        self.radix_cache.put(key, result)
+        return result
 
 
-class NeurosymbolicDataset(Dataset):
-    def __init__(self, texts: List[str], split_ratio: float = 0.8, max_samples: int = 100000):
-        self.samples: List[TextSample] = []
-        texts = (texts or [])[: int(max_samples)]
-        split_idx = int(len(texts) * float(split_ratio))
-        train_texts = texts[:split_idx]
-        val_texts = texts[split_idx:]
-
-        for text_list, split_name in [(train_texts, "train"), (val_texts, "val")]:
-            for t in text_list:
-                toks = basictokenize(t)
-                # less strict than original (>10 was too aggressive for some corpora)
-                if len(toks) >= 6:
-                    self.samples.append(TextSample(t, toks, split_name))
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        return self.samples[idx]
-
-
-def splitsentences(text: str, maxsentences: int = 20000) -> List[str]:
-    t = normalizetext(text)
-    if not t:
-        return []
-    # robust: split on punctuation or explicit separators; allow missing whitespace
-    parts = re.split(r"[.?!]+|(?:\s-\s)|(?:\s•\s)|\n+", t)
-    out: List[str] = []
-    for s in parts:
-        s = s.strip()
-        if s:
-            out.append(s)
-        if len(out) >= int(maxsentences):
-            break
-    return out
-
-
-def scoresentence(sentence: str, prep: PreparedCorpus) -> Tuple[float, Dict[str, float]]:
-    toks = basictokenize(sentence)
-    if not toks:
-        return -1e9, {}
-
-    boostvals = [prep.state.tokenboost.get(t, 0.0) for t in toks if t.isalpha()]
-    boostsum = float(sum(v for v in boostvals if v > 0))
-    boostuniq = float(sum(1 for t in toks if prep.state.tokenboost.get(t, 0.0) > 0))
-
-    Gs = SimpleGraph.fromtokensequence(toks, maxnodes=220)
-    sentsig = graphsignature(Gs)
-    structsim = abs(float(np.sum(prep.refsig["deghist"])) - float(np.sum(sentsig["deghist"])))
-    structsim = float(max(0.0, 1.0 - 0.5 * structsim))
-
-    nalpha = sum(1 for t in toks if t.isalpha())
-    ntotal = len(toks)
-    alpharatio = nalpha / max(1, ntotal)
-
-    score = (1.00 * boostsum + 0.65 * boostuniq + 1.20 * structsim + 0.40 * alpharatio - 0.01 * ntotal)
-    meta = {"boostsum": boostsum, "boostuniq": boostuniq, "len": float(ntotal), "struct": float(structsim), "alpharatio": float(alpharatio)}
-    return float(score), meta
-
-
-def extractpertinentpoints(
-    sourcetext: str,
-    prep: PreparedCorpus,
-    kpoints: int = 12,
-    minwords: int = 3,
-    maxwords: int = 140,
-    maxscansentences: int = 20000,
-) -> List[str]:
-    sents = splitsentences(sourcetext, maxsentences=int(maxscansentences))
-    if not sents:
-        return []
-
-    def count_words(s: str) -> int:
-        return len(re.findall(r"[A-Za-z]+", s))
-
-    scored: List[Tuple[float, str]] = []
-    for s in sents:
-        w = count_words(s)
-        if w < int(minwords) or w > int(maxwords):
-            continue
-        sc, _meta = scoresentence(s, prep)
-        scored.append((sc, s))
-
-    # Adaptive fallback if nothing passed the filters:
-    if not scored:
-        # loosen automatically
-        for s in sents:
-            w = count_words(s)
-            if w >= 2:
-                sc, _meta = scoresentence(s, prep)
-                scored.append((sc, s))
-            if len(scored) >= int(kpoints) * 5:
-                break
-
-    if not scored:
-        # final fallback: just return first k non-empty sentences
-        return [s.strip() for s in sents[: int(kpoints)] if s.strip()]
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-
-    def keynorm(ss: str) -> str:
-        toks = [t for t in basictokenize(ss) if t.isalpha() and t not in STOPWORDS][:80]
-        return " ".join(sorted(set(toks)))
-
-    seen = set()
-    out: List[str] = []
-    for _sc, s in scored[: int(kpoints) * 6]:
-        sig = keynorm(s)
-        if not sig or sig in seen:
-            continue
-        seen.add(sig)
-        out.append(s.strip())
-        if len(out) >= int(kpoints):
-            break
-    return out
-
-
-def formatpoints(points: List[str]) -> str:
-    if not points:
-        return "No inference points found (input text may be empty)."
-    lines = ["Pertinent points of inference:"]
-    for i, p in enumerate(points, 1):
-        lines.append(f"{i}. {p}")
-    return "\n".join(lines)
-
-
-# =============================================================================
-# Batched generation
-# =============================================================================
+# ----------------------------
+# Decoder (Probabilistic + Fuzzy Control)
+# ----------------------------
 
 @dataclass
 class DecodeStream:
-    streamid: int
-    tokensout: List[str] = field(default_factory=list)
-    w1: str = ""
-    w2: str = ""
-    w3: str = ""
+    stream_id: int
+    tokens_out: List[str]
+    w1: str
+    w2: str
+    w3: str
     done: bool = False
-    alphacount: int = 0
-    maxsteps: int = 240
-    stoptokens: set = field(default_factory=lambda: {".", "!", "?"})
-    minalpha: int = 80
-
+    alpha_count: int = 0
+    max_steps: int = 1000
+    stop_tokens: set = field(default_factory=lambda: {".", "!", "?"})
+    min_alpha: int = 200
 
 class ContinuousBatchDecoder:
-    def __init__(self, gen: NeuroSymbolicGraphGenerator, prep: PreparedCorpus, rng: np.random.Generator, tokenbudgetperround: int = 64):
+    def __init__(self, gen: NeuroSymbolicGraphGenerator, prep: PreparedCorpus, rng: np.random.Generator, token_budget_per_round: int = 64):
         self.gen = gen
         self.prep = prep
         self.rng = rng
-        self.tokenbudgetperround = int(max(1, tokenbudgetperround))
+        self.token_budget_per_round = int(max(1, token_budget_per_round))
 
-    def samplefuzzy(self, cand: List[str], probs: torch.Tensor, g: float) -> str:
+    def _sample_fuzzy(self, cand: List[str], probs: torch.Tensor, g: float) -> str:
         p = probs.detach().cpu().numpy().astype(np.float64)
-        p = p / float(p.sum() + 1e-12)
+        p = p / (float(p.sum()) + 1e-12)
+
+        # Fuzzy-controlled Gaspare pruning
+        # Higher g (gain) -> tighter distribution -> stricter cutoff
         mu = float(np.mean(p))
         std = float(np.std(p))
-        cutoff = mu + (1.0 - float(g)) * std
-        psparse = np.where(p > cutoff, p, 0.0)
-        if float(psparse.sum()) < 1e-12:
-            psparse = p
-        psparse = psparse / float(psparse.sum() + 1e-12)
-        return str(self.rng.choice(cand, p=psparse))
+        cutoff = mu + (1.0 - g) * std
 
-    def stepround(self, streams: List[DecodeStream]) -> None:
+        p_sparse = np.where(p > cutoff, p, 0.0)
+        if float(p_sparse.sum()) < 1e-12:
+            p_sparse = p
+
+        p_sparse = p_sparse / (float(p_sparse.sum()) + 1e-12)
+        return self.rng.choice(cand, p=p_sparse)
+
+    def step_round(self, streams: List[DecodeStream]) -> None:
         active = [s for s in streams if not s.done]
         if not active:
             return
-
         active.sort(key=lambda s: (s.w1, s.w2, s.w3))
-        active = active[: min(len(active), self.tokenbudgetperround)]
+        active = active[: min(len(active), self.token_budget_per_round)]
 
-        buckets: Dict[Tuple[str, str, str], List[DecodeStream]] = {}
+        groups = {}
         for s in active:
-            buckets.setdefault((s.w1, s.w2, s.w3), []).append(s)
+            groups.setdefault((s.w1, s.w2, s.w3), []).append(s)
 
-        self.gen.eval()
-        for (w1, w2, w3), bucket in buckets.items():
-            cand, probs, g = self.gen.finalprobsforcontextcached(self.prep, w1, w2, w3)
+        for (w1, w2, w3), bucket in groups.items():
+            cand, final_probs, g = self.gen._final_probs_for_context_cached(self.prep, w1, w2, w3)
+
             for s in bucket:
-                nxt = self.samplefuzzy(cand, probs, g)
-                s.tokensout.append(nxt)
+                nxt = self._sample_fuzzy(cand, final_probs, g)
+                s.tokens_out.append(nxt)
                 if nxt.isalpha():
-                    s.alphacount += 1
+                    s.alpha_count += 1
                 s.w1, s.w2, s.w3 = s.w2, s.w3, nxt
 
-                if s.alphacount >= int(s.maxsteps):
+                if s.alpha_count >= s.max_steps:
                     s.done = True
-                elif nxt in s.stoptokens and s.alphacount >= int(s.minalpha):
+                elif nxt in s.stop_tokens and s.alpha_count > s.min_alpha:
                     s.done = True
 
+
+# ----------------------------
+# SG Runtime
+# ----------------------------
 
 class SGPrompt:
-    def __init__(self, text: str):
-        self.text = str(text or "")
-
+    def __init__(self, text: str = ""):
+        self.text = str(text)
+    def __iadd__(self, other):
+        self.text += str(other)
+        return self
 
 class SGContext:
-    def __init__(self, corpustext: str, generator: NeuroSymbolicGraphGenerator, seed: int = 7):
-        self.corpustext = normalizetext(corpustext)
+    def __init__(self, corpus_text: str, generator: NeuroSymbolicGraphGenerator, seed: int = 7):
+        self.corpus_text = normalize(corpus_text)
         self.generator = generator
         self.seed = int(seed)
-        self.prepared: Optional[PreparedCorpus] = None
-
-    def ensureprepared(self):
+        self.prepared = None
+    def ensure_prepared(self):
         if self.prepared is None:
-            self.prepared = self.generator.preparecorpus(self.corpustext)
-
-    def clone(self, seedoffset: int) -> "SGContext":
-        ctx = SGContext(self.corpustext, self.generator, self.seed + int(seedoffset))
+            self.prepared = self.generator.prepare_corpus(self.corpus_text)
+    def clone(self, seed_offset: int):
+        ctx = SGContext(self.corpus_text, self.generator, self.seed + int(seed_offset))
         ctx.prepared = self.prepared
         return ctx
 
-
-def sggenbatched(ctxs: List[SGContext], prompts: List[SGPrompt], maxtokens: int = 240) -> List[str]:
-    if not ctxs or not prompts:
-        return [""] * len(prompts)
-
-    ctxs[0].ensureprepared()
+def sg_gen_batched(ctxs, prompts, max_tokens=240, seed_offsets=None, stop_at_punc=True):
+    if not ctxs:
+        return []
+    gen = ctxs[0].generator
+    ctxs[0].ensure_prepared()
     prep = ctxs[0].prepared
-    if prep is None:
-        return [""] * len(prompts)
-
     rng = np.random.default_rng(int(ctxs[0].seed))
-    streams: List[DecodeStream] = []
 
-    for i, (_ctx, prompt) in enumerate(zip(ctxs, prompts)):
-        seedwords = basictokenize(prompt.text)
-        w1, w2, w3 = ctxs[0].generator.pickinitialcontext(prep.lm, seedwords)
-        streams.append(
-            DecodeStream(
-                i,
-                w1=w1,
-                w2=w2,
-                w3=w3,
-                maxsteps=int(maxtokens),
-                minalpha=max(20, int(maxtokens) // 3),
-            )
-        )
+    streams = []
+    for i, (ctx, prompt) in enumerate(zip(ctxs, prompts)):
+        off = seed_offsets[i] if seed_offsets else i
+        local_seed = int(ctx.seed + off)
+        local_rng = np.random.default_rng(local_seed)  # kept (unused)
+        seed_words = basic_tokenize(prompt.text)
+        w1, w2, w3 = gen._pick_initial_context(prep.lm, seed_words)
+        streams.append(DecodeStream(
+            i, [w1, w2, w3], w1, w2, w3,
+            max_steps=max_tokens,
+            min_alpha=max_tokens//2 if stop_at_punc else 99999
+        ))
 
-    decoder = ContinuousBatchDecoder(ctxs[0].generator, prep, rng, tokenbudgetperround=64)
-    for _ in range(max(1, int(maxtokens))):
+    decoder = ContinuousBatchDecoder(gen, prep, rng, token_budget_per_round=64)
+    for _ in range(max_tokens * 2):
         if all(s.done for s in streams):
             break
-        decoder.stepround(streams)
+        decoder.step_round(streams)
 
-    return [detokenize(s.tokensout) for s in streams]
+    return [detokenize(s.tokens_out[3:]) for s in streams]
 
+def sg_fork(ctx, prompt, n):
+    ctx.ensure_prepared()
+    return [(ctx.clone(1000+i), SGPrompt(prompt.text)) for i in range(n)]
 
-def sgfork(ctx: SGContext, prompt: SGPrompt, n: int) -> List[Tuple[SGContext, SGPrompt]]:
-    # Fixed comprehension (your original was syntactically invalid). [file:1]
-    ctx.ensureprepared()
-    return [(ctx.clone(1000 + i), SGPrompt(prompt.text)) for i in range(int(n))]
+def sg_join(prompts, joiner="\n\n"):
+    return SGPrompt(joiner.join(p.text for p in prompts))
 
+# ----------------------------
+# HF Dataset Loader (NEW)
+# ----------------------------
 
-# =============================================================================
-# HF loading helpers
-# =============================================================================
+_PREFER_TEXT_COLS = ["text", "content", "article", "body", "markdown", "md", "html", "raw"]
 
-PREFERTEXTCOLS = ["text", "content", "article", "body", "markdown", "md", "html", "raw"]
-
-
-def picktextcolumndssplit(split):
-    feats = split.features
-    stringcols = [k for k, v in feats.items() if isinstance(v, Value) and v.dtype == "string"]
-    if not stringcols:
+def _pick_text_column(ds_split) -> str:
+    feats = ds_split.features
+    string_cols = [k for k, v in feats.items() if isinstance(v, Value) and v.dtype == "string"]
+    if not string_cols:
+        # Sometimes nested structs exist; you can extend this if needed.
         raise ValueError(f"No top-level string columns found. features={feats}")
 
-    for pref in PREFERTEXTCOLS:
-        for c in stringcols:
+    for pref in _PREFER_TEXT_COLS:
+        for c in string_cols:
             if c.lower() == pref:
                 return c
-    for pref in PREFERTEXTCOLS:
-        for c in stringcols:
+    for pref in _PREFER_TEXT_COLS:
+        for c in string_cols:
             if pref in c.lower():
                 return c
-    return stringcols[0]
+    return string_cols[0]
 
+def load_hf_corpus(
+    dataset_name: str,
+    split_name: str = "text",
+    max_rows: int = 0,
+    joiner: str = "\n\n",
+    cache_dir: str = ".hf_cache"
+) -> Tuple[str, Dict[str, Any]]:
+    """
+    Returns (corpus_text, meta)
+    max_rows=0 means "all".
+    """
+    ds = load_dataset(dataset_name, cache_dir=cache_dir)
+    use_split = split_name if split_name in ds else next(iter(ds.keys()))
+    split = ds[use_split]
+    text_col = _pick_text_column(split)
 
-def loadhfcorpus(datasetname: str, splitname: str = "train", maxrows: int = 0, joiner: str = " ") -> Tuple[str, Dict[str, Any]]:
-    ds = load_dataset(datasetname)
-    usesplit = splitname if splitname in ds else next(iter(ds.keys()))
-    split = ds[usesplit]
-    textcol = picktextcolumndssplit(split)
-
-    ntotal = len(split)
-    maxrows = int(maxrows) if maxrows else 0
-    if maxrows > 0:
-        ntake = min(maxrows, ntotal)
-        split = split.select(range(ntake))
+    n_total = len(split)
+    if isinstance(max_rows, float):
+        max_rows = int(max_rows)
+    if max_rows and max_rows > 0:
+        n_take = min(int(max_rows), n_total)
+        split = split.select(range(n_take))
     else:
-        ntake = ntotal
+        n_take = n_total
 
-    parts: List[str] = []
+    def _norm(s: str) -> str:
+        return normalize(s)
+
+    parts = []
     for row in split:
-        v = row.get(textcol, None)
+        v = row.get(text_col, None)
         if isinstance(v, str):
-            v = normalizetext(v)
+            v = _norm(v)
             if v:
                 parts.append(v)
 
     corpus = joiner.join(parts)
     meta = {
-        "dataset": datasetname,
-        "split": usesplit,
-        "textcol": textcol,
-        "rowsused": ntake,
-        "rowsnonempty": len(parts),
+        "dataset": dataset_name,
+        "split": use_split,
+        "text_col": text_col,
+        "rows_used": n_take,
+        "rows_nonempty": len(parts),
         "chars": len(corpus),
         "columns": list(split.column_names),
     }
     return corpus, meta
 
 
-def resolvegradiofiletopath(infile) -> str:
-    if infile is None:
-        raise ValueError("No input file provided.")
-    if isinstance(infile, str):
-        return infile
-    if hasattr(infile, "name") and isinstance(infile.name, str):
-        return infile.name
-    if isinstance(infile, dict) and "path" in infile:
-        return str(infile["path"])
-    if hasattr(infile, "path"):
-        return str(infile.path)
-    raise ValueError(f"Unsupported infile type: {type(infile)}")
+# ----------------------------
+# Main program function (MODIFIED)
+# ----------------------------
 
-
-def _load_corpus(infile, usehf: bool, hfdataset: str, hfsplit: str, hfmaxrows: int) -> Tuple[str, str]:
-    if usehf:
-        corpustext, meta = loadhfcorpus(hfdataset.strip(), hfsplit.strip(), maxrows=int(hfmaxrows) if hfmaxrows else 0)
-        header = (
-            f"HF dataset {meta['dataset']} split {meta['split']} textcol {meta['textcol']} "
-            f"rows_used {meta['rowsused']} nonempty {meta['rowsnonempty']} chars {meta['chars']}"
+def run_program(
+    infile,
+    use_hf: bool,
+    hf_dataset: str,
+    hf_split: str,
+    hf_max_rows: int,
+    n_take: int,
+    seed: int,
+    steer: float,
+    focus: float,
+    takeaway_prompt: str,
+    summary_prompt: str,
+):
+    if use_hf:
+        corpus_text, meta = load_hf_corpus(
+            dataset_name=str(hf_dataset).strip(),
+            split_name=str(hf_split).strip(),
+            max_rows=int(hf_max_rows) if hf_max_rows else 0,
         )
-        return corpustext, header
-    path = resolvegradiofiletopath(infile)
-    corpustext = loadtext(path)
-    header = f"FILE {Path(path).name} chars {len(corpustext)}"
-    return corpustext, header
+        header = (
+            f"[HF] dataset={meta['dataset']} split={meta['split']} text_col={meta['text_col']} "
+            f"rows_used={meta['rows_used']} nonempty={meta['rows_nonempty']} chars={meta['chars']}\n\n"
+        )
+    else:
+        path = _resolve_gradio_file_to_path(infile)
+        corpus_text = load_text(path)
+        header = f"[FILE] {Path(path).name} chars={len(corpus_text)}\n\n"
 
-
-# =============================================================================
-# Train / Validate
-# =============================================================================
-
-def train_and_evaluate(
-    infile=None,
-    usehf=True,
-    hfdataset="AiresPucrs/stanford-encyclopedia-philosophy",
-    hfsplit="train",
-    hfmaxrows=50000,
-    seed=42,
-    epochs=3,
-    steer=1.35,
-    focus=0.5,
-    batch_size=32,
-    lr=0.001,
-) -> Tuple[str, NeuroSymbolicGraphGenerator, str, str]:
-    torch.manual_seed(int(seed))
-    np.random.seed(int(seed))
-    random.seed(int(seed))
-
-    corpustext, header = _load_corpus(infile, bool(usehf), str(hfdataset), str(hfsplit), int(hfmaxrows))
-
-    sents = splitsentences(corpustext, maxsentences=20000)
-    dataset = NeurosymbolicDataset(sents, split_ratio=0.8, max_samples=100000)
-
-    train_ds = [s for s in dataset.samples if s.split == "train"]
-    val_ds = [s for s in dataset.samples if s.split == "val"]
-
-    train_loader = DataLoader(train_ds, batch_size=int(batch_size), shuffle=True, collate_fn=lambda x: x)
-    val_loader = DataLoader(val_ds, batch_size=int(batch_size), shuffle=False, collate_fn=lambda x: x)
-
-    model = NeuroSymbolicGraphGenerator(steerstrength=float(steer), focusstrength=float(focus), radixcacheitems=30000)
-    optimizer = optim.Adam(model.parameters(), lr=float(lr), weight_decay=1e-5)
-
-    def nll_from_probs(probs_1d: torch.Tensor, target_idx: int) -> torch.Tensor:
-        logp = torch.log(probs_1d.clamp(min=1e-12)).unsqueeze(0)  # [1,C]
-        target = torch.tensor([int(target_idx)], dtype=torch.long)
-        return F.nll_loss(logp, target)
-
-    # TRAIN
-    model.train()
-    train_losses: List[float] = []
-
-    for ep in range(int(epochs)):
-        epoch_loss = 0.0
-        nb = 0
-        for batch in train_loader:
-            optimizer.zero_grad(set_to_none=True)
-            losses: List[torch.Tensor] = []
-
-            for sample in batch[:8]:
-                try:
-                    prep = model.preparecorpus(sample.text)
-                    toks = sample.tokens[:10]
-                    if len(toks) < 4:
-                        continue
-                    w1, w2, w3 = model.pickinitialcontext(prep.lm, toks[:3])
-                    cand, probs, _g = model.finalprobsforcontextcached(prep, w1, w2, w3)
-                    target = toks[3]
-                    if target in cand:
-                        losses.append(nll_from_probs(probs, cand.index(target)))
-                except Exception:
-                    continue
-
-            if losses:
-                batch_loss = torch.stack(losses).mean()
-                batch_loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                epoch_loss += float(batch_loss.detach().item())
-                nb += 1
-
-        train_losses.append(epoch_loss / max(1, nb))
-        model.bumpcacheversion()
-
-    # VALIDATE
-    model.eval()
-    vloss = 0.0
-    vcount = 0
-    last_g = 0.0
-    with torch.no_grad():
-        for batch in val_loader:
-            for sample in batch[:8]:
-                try:
-                    prep = model.preparecorpus(sample.text)
-                    toks = sample.tokens[:10]
-                    if len(toks) < 4:
-                        continue
-                    w1, w2, w3 = model.pickinitialcontext(prep.lm, toks[:3])
-                    cand, probs, g = model.finalprobsforcontextcached(prep, w1, w2, w3)
-                    last_g = float(g)
-                    target = toks[3]
-                    if target in cand:
-                        vloss += float(nll_from_probs(probs, cand.index(target)).item())
-                        vcount += 1
-                except Exception:
-                    continue
-
-    avg_vloss = vloss / max(1, vcount)
-    ppl = math.exp(avg_vloss) if vcount > 0 else 0.0
-
-    # INFERENCE POINTS from validation corpus (larger slice to ensure content)
-    val_corpus = " ".join(s.text for s in val_ds[:800])
-    prep_val = model.preparecorpus(val_corpus)
-    points = extractpertinentpoints(val_corpus, prep_val, kpoints=12)
-
-    report = (
-        f"{header}\n\n"
-        f"TRAIN DONE: epochs={int(epochs)}\n"
-        f"Training samples={len(train_ds)}  Validation samples={len(val_ds)}\n"
-        f"Train loss={train_losses[-1] if train_losses else 0.0:.4f}\n\n"
-        f"VAL: loss={avg_vloss:.4f} perplexity={ppl:.2f} scored_samples={vcount}\n"
-        f"Fuzzy gain g={last_g:.3f}\n\n"
-        f"{formatpoints(points)}\n\n"
-        f"Learned: steer_scale={float(model.steer_scale.detach().item()):.4f} "
-        f"temp_scale={float(model.temp_scale.detach().item()):.4f} "
-        f"boost_scale={float(model.boost_scale.detach().item()):.4f}"
+    gen = NeuroSymbolicGraphGenerator(
+        steer_strength=float(steer),
+        focus_strength=float(focus),
+        radix_cache_items=30000
     )
-    return report, model, corpustext, header
+    ctx = SGContext(corpus_text, gen, seed=int(seed))
+    ctx.ensure_prepared()
+
+    root = SGPrompt(str(takeaway_prompt).strip() + "\n\n")
+    branches = sg_fork(ctx, root, n=int(n_take))
+    branch_ctxs, branch_prompts = zip(*branches)
+    branch_ctxs = list(branch_ctxs)
+    branch_prompts = list(branch_prompts)
+
+    for i, bp in enumerate(branch_prompts):
+        bp += f"[Takeaway {i+1}] "
+
+    take_texts = sg_gen_batched(branch_ctxs, branch_prompts, max_tokens=620, stop_at_punc=True)
+
+    for i, txt in enumerate(take_texts):
+        branch_prompts[i] += txt
+
+    merged = sg_join(branch_prompts, joiner="\n\n")
+    final_prompt = SGPrompt(summary_prompt.replace("{joined_takeaways}", merged.text))
+    final_text = sg_gen_batched([ctx], [final_prompt], max_tokens=260)[0]
+
+    return header + final_prompt.text + final_text
 
 
-# =============================================================================
-# Gradio (separate Train / Generate)
-# =============================================================================
+# ----------------------------
+# Gradio (MODIFIED)
+# ----------------------------
 
-APP_STATE = {"model": None, "corpustext": "", "header": ""}
-
-
-def ui_train(infile, usehf, hfdataset, hfsplit, hfmaxrows, seed, epochs, steer, focus, lr, batch_size):
-    report, model, corpustext, header = train_and_evaluate(
-        infile=infile,
-        usehf=usehf,
-        hfdataset=hfdataset,
-        hfsplit=hfsplit,
-        hfmaxrows=hfmaxrows,
-        seed=seed,
-        epochs=epochs,
-        steer=steer,
-        focus=focus,
-        lr=lr,
-        batch_size=batch_size,
-    )
-    APP_STATE["model"] = model
-    APP_STATE["corpustext"] = corpustext
-    APP_STATE["header"] = header
-    return "OK: trained in memory. Now click Generate.", report
-
-
-def ui_generate(prompt_text: str, nsamples: int, maxtokens: int, seed: int, use_trained_context: bool):
-    prompt_text = str(prompt_text or "").strip()
-    if not prompt_text:
-        return "Enter a prompt."
-
-    model = APP_STATE.get("model", None)
-    corpustext = APP_STATE.get("corpustext", "")
-
-    if model is None:
-        model = NeuroSymbolicGraphGenerator()
-        corpustext = corpustext or prompt_text
-
-    context_text = corpustext if (bool(use_trained_context) and corpustext.strip()) else prompt_text
-
-    ctx0 = SGContext(context_text, model, seed=int(seed))
-    pairs = sgfork(ctx0, SGPrompt(prompt_text), int(nsamples))
-    ctxs = [c for (c, _p) in pairs]
-    prompts = [_p for (_c, _p) in pairs]
-    outs = sggenbatched(ctxs, prompts, maxtokens=int(maxtokens))
-
-    blocks: List[str] = []
-    for i, o in enumerate(outs, 1):
-        blocks.append(f"=== Sample {i} ===\n{o}")
-    return "\n\n".join(blocks)
-
-
-def buildapp():
-    with gr.Blocks(title="Neurosymbolic — Separate Train / Generate") as demo:
-        gr.Markdown("# Neurosymbolic (Patched) — Separate Train and Generate")
-
-        status = gr.Textbox(label="Status", value="Idle", interactive=False)
+def build_app():
+    with gr.Blocks(title="Neurosymbolic V3.8 (Sugeno Fuzzy Logic) + HF Dataset") as demo:
+        gr.Markdown(
+            "# Neurosymbolic V3.8: Sugeno Fuzzy Logic Control\n"
+            "*Logic gates (AND/OR) control inference dynamics. No neural gates. No Argmax.*\n\n"
+            "You can upload a corpus file **or** load a Hugging Face dataset."
+        )
 
         with gr.Row():
             with gr.Column(scale=1):
-                gr.Markdown("## Train")
-                usehf = gr.Checkbox(label="Use Hugging Face dataset", value=True)
-                hfdataset = gr.Textbox(label="HF dataset name", value="AiresPucrs/stanford-encyclopedia-philosophy")
-                hfsplit = gr.Textbox(label="HF split", value="train")
-                hfmaxrows = gr.Slider(0, 200000, value=50000, step=500, label="HF max rows (0 = all; bigger = better points)")
-                infile = gr.File(label="Input file (.txt/.md) if not using HF", file_types=[".txt", ".md"])
+                use_hf = gr.Checkbox(label="Use Hugging Face dataset", value=True)
 
-                seed = gr.Number(value=42, label="Seed")
-                epochs = gr.Slider(1, 10, value=3, step=1, label="Epochs")
-                steer = gr.Slider(0, 5, value=1.35, step=0.05, label="Steer strength")
-                focus = gr.Slider(0, 1, value=0.5, step=0.05, label="Focus strength")
-                lr = gr.Slider(0.0001, 0.01, value=0.001, step=0.0001, label="Learning rate")
-                batch_size = gr.Slider(8, 128, value=32, step=8, label="Batch size")
+                hf_dataset = gr.Textbox(
+                    label="HF dataset name",
+                    value="AiresPucrs/stanford-encyclopedia-philosophy",
+                    interactive=True,
+                )
+                hf_split = gr.Textbox(label="HF split (optional)", value="text", interactive=True)
+                hf_max_rows = gr.Slider(0, 20000, value=2000, step=100, label="HF max rows (0 = all)")
 
-                btn_train = gr.Button("Train", variant="primary")
+                infile = gr.File(label="Input File (txt/md) if not using HF", file_types=[".txt", ".md"])
 
-            with gr.Column(scale=1):
-                gr.Markdown("## Generate")
-                prompt = gr.Textbox(label="Prompt", lines=5)
-                nsamples = gr.Slider(1, 10, value=3, step=1, label="Samples")
-                maxtokens = gr.Slider(20, 600, value=200, step=10, label="Max tokens")
-                gseed = gr.Number(value=7, label="Generation seed")
-                use_trained_context = gr.Checkbox(label="Use trained corpus as context", value=True)
-                btn_gen = gr.Button("Generate", variant="secondary")
+            with gr.Column(scale=2):
+                out_txt = gr.Textbox(label="Output", lines=24)
 
-        train_out = gr.Textbox(label="Train report", lines=18, max_lines=60)
-        gen_out = gr.Textbox(label="Generated text", lines=18, max_lines=80)
+        with gr.Row():
+            n_take = gr.Slider(1, 10, value=5, label="Parallel Batches")
+            seed = gr.Number(value=42, label="Seed")
 
-        btn_train.click(
-            ui_train,
-            inputs=[infile, usehf, hfdataset, hfsplit, hfmaxrows, seed, epochs, steer, focus, lr, batch_size],
-            outputs=[status, train_out],
+        with gr.Row():
+            steer = gr.Slider(0, 5, value=1.35, label="Base Steer")
+            focus = gr.Slider(0, 1, value=0.5, label="Focus")
+
+        p_takeaway = gr.Textbox(label="Prefix", value="", lines=2)
+        p_summary = gr.Textbox(
+            label="Summary Prompt",
+            value="explain this?",
+            lines=4
         )
-        btn_gen.click(
-            ui_generate,
-            inputs=[prompt, nsamples, maxtokens, gseed, use_trained_context],
-            outputs=[gen_out],
+
+        btn = gr.Button("Run Fuzzy Logic Generator", variant="primary")
+        btn.click(
+            run_program,
+            inputs=[infile, use_hf, hf_dataset, hf_split, hf_max_rows, n_take, seed, steer, focus, p_takeaway, p_summary],
+            outputs=out_txt
         )
 
     return demo
 
 
 if __name__ == "__main__":
-    demo = buildapp()
-    demo.queue().launch(share=True)
+    app = build_app()
+    app.queue().launch()

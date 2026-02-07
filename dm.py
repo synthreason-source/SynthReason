@@ -26,10 +26,10 @@ client = tweepy.Client(
 )
 
 # Config - EDIT THESE
-TARGET_USERNAME = 'elonmusk'  # Feed to monitor
+TARGET_USERNAME = 'GeorgeW479744'  # Feed to monitor
 FILTER_KEYWORD = 'AI'         # Posts must contain this
 MAX_TWEETS = 10              # Recent tweets to check
-RECIPIENTS = ['lexfridman', 'pmarca', 'sama', 'karpathy']  # DM targets (@ not needed)
+RECIPIENTS = ['GeorgeW479744']  # DM targets (@ not needed)
 
 # Globals
 relevant_tweets = []

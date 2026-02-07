@@ -2,12 +2,15 @@
 # -*- coding: utf-8 -*-
 """
 Graph-Theoretic Neurosymbolic Text Generator (Gradio GUI)
-V3.8 + Sugeno Fuzzy Logic Control (No Neural Gate, No Argmax)
+V3.9 + Sugeno Fuzzy Logic + Cognitive Tokens (PROBLEM/SOLUTION markers)
 
-HF Dataset integration:
-- Adds option to load Hugging Face dataset "AiresPucrs/stanford-encyclopedia-philosophy"
-- Auto-detects the dataset "text" column (or best string column)
-- Joins rows into one corpus string and runs your generator on it
+Features:
+1. Cognitive Tokens: Automatically detects problem/solution patterns in text and injects 
+   non-generatable [PROBLEM] and [SOLUTION] markers. These act as high-gravity 
+   semantic landmarks for the fuzzy controller.
+2. Sugeno Fuzzy Logic: Logic gates (AND/OR/NOT) control inference dynamics.
+3. Hugging Face Integration: Load datasets directly.
+4. Graph Theory: WL-Hashing and Spectral decomposition for context tracking.
 
 Dependencies:
   pip install gradio numpy torch datasets
@@ -26,11 +29,20 @@ import gradio as gr
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim  # kept (unused, but harmless)
 
 # HF datasets
 from datasets import load_dataset, Value
 
+# ----------------------------
+# CONSTANTS & COGNITIVE PATTERNS
+# ----------------------------
+
+# These tokens are injected for structure but NEVER generated as output.
+# They receive high boost to steer the narrative towards these concepts.
+COGNITIVE_TOKENS = {
+    "[PROBLEM]": 2.5,   # High gravity
+    "[SOLUTION]": 3.0,  # Maximum gravity
+}
 
 STOP_WORDS = set(
     """
@@ -39,6 +51,137 @@ STOP_WORDS = set(
     which who will with you your yours
     """.split()
 )
+
+# Regex patterns to detect implicit problems/solutions in raw text
+PROBLEM_PATTERNS = [
+    r"(?:problem|issue|challenge|difficulty|question|dilemma|paradox|conundrum|puzzle|obstacle)[s]?\s*(?:of|in|with|for|to)?\s*(?:the\s+)?(?:\w+\s*){0,10}\?",
+    r"(?:what|how|why|when|where)\s+\w+\s+(?:problem|issue|challenge|question)[s]?\??",
+    r"(?:solve|address|overcome|tackle|resolve)\s+(?:the\s+)?(?:problem|issue|challenge)[s]?\s*(?:of|in|with)?",
+    r"(?:facing|encounter|meet|confront)\s+(?:the\s+)?(?:problem|issue|difficulty)[s]?\s*(?:of|with)?",
+]
+
+SOLUTION_PATTERNS = [
+    r"(?:solution|answer|resolution|fix|remedy|approach|method|strategy|technique)[s]?\s*(?:is|are|to|for|of)?\s*(?:the\s+)?(?:\w+\s*){0,8}(?:\.|:)",
+    r"(?:solved|resolved|fixed|addressed|overcome|tackled)\s+(?:by|using|through|with)\s*(?:the\s+)?(?:\w+\s*){0,10}",
+    r"(?:key|best|optimal|effective)\s+(?:solution|approach|strategy|method)[s]?\s*(?:is|are|:)",
+    r"(?:this|it)\s+(?:can|may|might|should|will)\s+be\s+(?:solved|addressed|resolved)\s+(?:by|using|with)",
+]
+
+# ----------------------------
+# Text Processing & Cognitive Injection
+# ----------------------------
+
+def inject_cognitive_tokens(text: str) -> str:
+    """
+    Scans text for problem/solution patterns and prepends [PROBLEM] or [SOLUTION] tags.
+    This creates 'semantic landmarks' in the graph.
+    """
+    lines = text.split('\n')
+    marked_lines = []
+    
+    for i, line in enumerate(lines):
+        orig_line = line
+        modified = False
+        
+        # Check Solution patterns first (specific)
+        for pat in SOLUTION_PATTERNS:
+            if re.search(pat, line, re.IGNORECASE):
+                line = f"[SOLUTION] {line}"
+                modified = True
+                break
+        
+        # Check Problem patterns if not already marked
+        if not modified:
+            for pat in PROBLEM_PATTERNS:
+                if re.search(pat, line, re.IGNORECASE):
+                    line = f"[PROBLEM] {line}"
+                    break
+        
+        # Heuristic: Check for question-answer pairs across adjacent lines
+        if i > 0 and '?' in marked_lines[-1] and not "[SOLUTION]" in line:
+            if any(word in orig_line.lower() for word in ['answer', 'solution', 'because', 'since', 'therefore']):
+                line = f"[SOLUTION] {line}"
+        
+        marked_lines.append(line)
+    
+    return '\n'.join(marked_lines)
+
+def _token_class(tok: str) -> str:
+    if tok in COGNITIVE_TOKENS:
+        return "COG"
+    if tok in [".", ",", ";", ":", "!", "?", "(", ")"]:
+        return "PUNC"
+    if not re.match(r"[a-z]", tok):
+        return "OTHER"
+    L = len(tok)
+    return "S" if L <= 3 else "M" if L <= 7 else "L"
+
+def normalize(text: str) -> str:
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+def basic_tokenize(text: str) -> List[str]:
+    text = text.replace("\n", " ")
+    # Regex modified to catch [PROBLEM] and [SOLUTION] as single tokens
+    tokens = re.findall(r"\[[A-Z]+\]|[A-Za-z][A-Za-z0-9_'-]*|[.,;:!?()]", text)
+    out = []
+    for t in tokens:
+        if t in COGNITIVE_TOKENS:
+            out.append(t) # Keep exact case for markers
+        elif re.match(r"[A-Za-z]", t):
+            out.append(t.lower())
+        else:
+            out.append(t)
+    return out
+
+def detokenize(tokens: List[str]) -> str:
+    out = []
+    for t in tokens:
+        # Don't output cognitive tokens in final text
+        if t in COGNITIVE_TOKENS:
+            continue
+            
+        if t in [".", ",", ";", ":", "!", "?", ")", "("]:
+            if t in ["(", ")"]:
+                out.append(t)
+            else:
+                if out:
+                    out[-1] += t
+                else:
+                    out.append(t)
+        else:
+            if out and out[-1].endswith("("):
+                out[-1] += t
+            else:
+                out.append(t)
+    s = " ".join(out)
+    s = re.sub(r"\(\s+", "(", s)
+    s = re.sub(r"\s+\)", ")", s)
+    s = re.sub(r"(^|[.!?]\s+)([a-z])", lambda m: m.group(1) + m.group(2).upper(), s)
+    return s
+
+def load_text(path: str) -> str:
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"File not found: {p}")
+    if p.suffix.lower() in [".txt", ".md"]:
+        return p.read_text(encoding="utf-8", errors="replace")
+    raise ValueError("Unsupported file extension")
+
+def _resolve_gradio_file_to_path(infile) -> str:
+    if infile is None:
+        raise ValueError("No input file provided.")
+    if isinstance(infile, str):
+        return infile
+    if hasattr(infile, "name") and isinstance(infile.name, str):
+        return infile.name
+    if isinstance(infile, dict) and "path" in infile:
+        return str(infile["path"])
+    if hasattr(infile, "path"):
+        return str(infile.path)
+    raise ValueError(f"Unsupported infile type: {type(infile)}")
 
 # ----------------------------
 # Pure-Python TF-IDF + SVD
@@ -72,7 +215,6 @@ def pure_tfidf(docs: List[str], max_features: int = 8000) -> Tuple[np.ndarray, L
                 X[i, j] = tf * idf
     return X, vocab
 
-
 def pure_truncated_svd(X: np.ndarray, n_components: int, random_state: int = 42) -> Any:
     np.random.seed(random_state)
     m, n = X.shape
@@ -91,87 +233,6 @@ def pure_truncated_svd(X: np.ndarray, n_components: int, random_state: int = 42)
     U, S, Vt = np.linalg.svd(B, full_matrices=False)
     return type("SVD", (), {"components_": Vt[:k]})()
 
-
-# ----------------------------
-# Helper Functions
-# ----------------------------
-
-def _token_class(tok: str) -> str:
-    if tok in [".", ",", ";", ":", "!", "?", "(", ")"]:
-        return "PUNC"
-    if not re.match(r"[a-z]", tok):
-        return "OTHER"
-    L = len(tok)
-    return "S" if L <= 3 else "M" if L <= 7 else "L"
-
-def normalize(text: str) -> str:
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-def basic_tokenize(text: str) -> List[str]:
-    text = text.replace("\n", " ")
-    tokens = re.findall(r"[A-Za-z][A-Za-z0-9_\-']*|[.,;:!?()]", text)
-    out = []
-    for t in tokens:
-        if re.match(r"[A-Za-z]", t):
-            out.append(t.lower())
-        else:
-            out.append(t)
-    return out
-
-def detokenize(tokens: List[str]) -> str:
-    out = []
-    for t in tokens:
-        if t in [".", ",", ";", ":", "!", "?", ")", "("]:
-            if t in ["(", ")"]:
-                out.append(t)
-            else:
-                if out:
-                    out[-1] += t
-                else:
-                    out.append(t)
-        else:
-            if out and out[-1].endswith("("):
-                out[-1] += t
-            else:
-                out.append(t)
-    s = " ".join(out)
-    s = re.sub(r"\(\s+", "(", s)
-    s = re.sub(r"\s+\)", ")", s)
-    s = re.sub(r"(^|[.!?]\s+)([a-z])", lambda m: m.group(1) + m.group(2).upper(), s)
-    return s
-
-def load_text(path: str) -> str:
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(f"File not found: {p}")
-    if p.suffix.lower() in [".txt", ".md"]:
-        return p.read_text(encoding="utf-8", errors="replace")
-    raise ValueError("Unsupported file extension")
-
-def _resolve_gradio_file_to_path(infile) -> str:
-    """
-    Gradio versions vary:
-    - may pass a tempfile object with .name
-    - may pass a dict-like with 'path'
-    - may pass a plain string path
-    """
-    if infile is None:
-        raise ValueError("No input file provided.")
-    if isinstance(infile, str):
-        return infile
-    if hasattr(infile, "name") and isinstance(infile.name, str):
-        return infile.name
-    if isinstance(infile, dict) and "path" in infile:
-        return str(infile["path"])
-    # last resort: try attribute 'path'
-    if hasattr(infile, "path"):
-        return str(infile.path)
-    raise ValueError(f"Unsupported infile type: {type(infile)}")
-
-
 # ----------------------------
 # Graph Components
 # ----------------------------
@@ -180,17 +241,26 @@ def _resolve_gradio_file_to_path(infile) -> str:
 class SimpleGraph:
     nodes: List[Dict[str, Any]]
     edges: List[Tuple[int, int, Dict[str, Any]]]
+    cognitive_map: Dict[str, List[int]]  # Stores positions of PROBLEM/SOLUTION
 
     @classmethod
     def from_token_sequence(cls, tokens: List[str], max_nodes: int = 220):
         toks = tokens[:max_nodes]
         nodes = [{"id": i, "cls": _token_class(t)} for i, t in enumerate(toks)]
         edges = []
+        cog_map = {"[PROBLEM]": [], "[SOLUTION]": []}
+
         for i in range(len(toks) - 1):
             edges.append((i, i + 1, {"rel": "adj"}))
         for i in range(len(toks) - 2):
             edges.append((i, i + 2, {"rel": "skip"}))
-        return cls(nodes, edges)
+        
+        # Track cognitive markers
+        for i, t in enumerate(toks):
+            if t in COGNITIVE_TOKENS:
+                cog_map[t].append(i)
+
+        return cls(nodes, edges, cog_map)
 
     def degree_histogram(self, max_bins: int = 16) -> np.ndarray:
         degrees = [0] * max_bins
@@ -237,24 +307,8 @@ def graph_signature(G: SimpleGraph) -> Dict[str, object]:
         "deg_hist": G.degree_histogram(),
         "wl": G.weisfeiler_lehman_hash(),
         "aut_est": G.automorphism_estimate(),
+        "cognitive_density": sum(len(v) for v in G.cognitive_map.values())
     }
-
-def passes_automorphism_checks(ref_sig, out_sig, geometric_strength: float = 0.3) -> bool:
-    strict = max(0.0, min(2.0, geometric_strength))
-    ref = ref_sig["deg_hist"].astype(float)
-    ref = ref / (ref.sum() + 1e-12)
-    out = out_sig["deg_hist"].astype(float)
-    out = out / (out.sum() + 1e-12)
-    if np.abs(ref - out).sum() > max(0.25, 1.10 - 0.35 * strict):
-        return False
-    ratio = max(1, out_sig["aut_est"]) / max(1, ref_sig["aut_est"])
-    band = max(1.3, 3.5 - 1.2 * min(1.0, strict / 2.0))
-    if not (1.0 / band <= ratio <= band):
-        return False
-    if strict >= 1.6 and out_sig["wl"] != ref_sig["wl"]:
-        return False
-    return True
-
 
 # ----------------------------
 # Fuzzy Logic Controller (Sugeno)
@@ -282,7 +336,7 @@ def snorm_max(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 class FuzzyWeightController(nn.Module):
     """
     Serial fuzzy logic gates producing a gain g in [0,1].
-    Sugeno defuzzification: weighted average of constant consequents.
+    Sugeno defuzzification.
     """
     def __init__(self):
         super().__init__()
@@ -323,18 +377,18 @@ class FuzzyWeightController(nn.Module):
         W = torch.stack([w1, w2, w3, w4]).to(dtype=torch.float32).clamp_min(0.0)
 
         g = (W * Z).sum() / (W.sum() + 1e-12)
-        return g.clamp(0.0, 1.0)
+        return g.clamp(0.0, 0.5)
 
 
 # ----------------------------
-# Neural Modules (Lateral Inhibition only)
+# Neural Modules
 # ----------------------------
 
 class LateralInhibition(nn.Module):
     def __init__(self, kernel_size=7, strength=0.5):
         super().__init__()
         self.strength = float(strength)
-        k = torch.tensor([-0.95, -0.9, -0.1, 0.3, -1.4, -1.2, -1.05], dtype=torch.float32)
+        k = torch.tensor([-0.15, -0.1, -0.1, 0.1, -0.1, -0.1, -0.1], dtype=torch.float32)
         self.register_buffer("kernel", k.view(1, 1, -1))
         self.pad = int(kernel_size // 2)
 
@@ -377,6 +431,10 @@ class QuadgramLM:
         self.tri.clear()
         self.quad.clear()
         self.total = 0
+        
+        # We allow cognitive tokens in history to form context,
+        # but we generally exclude them from unigram counts used for generation 
+        # unless we explicitly want to track them. Here we just ingest all.
         for t in tokens:
             self.uni[t] = self.uni.get(t, 0) + 1
             self.total += 1
@@ -407,10 +465,11 @@ class QuadgramLM:
         if not cont:
             cont = [w for w, _ in sorted(self.uni.items(), key=lambda x: x[1], reverse=True)[:200]]
 
+        # Filter out cognitive tokens from candidates - they are non-generatable
         seen = set()
         cand = []
         for w in cont:
-            if w not in seen:
+            if w not in seen and w not in COGNITIVE_TOKENS:
                 seen.add(w)
                 cand.append(w)
         cand = cand[:500]
@@ -434,7 +493,12 @@ class QuadgramLM:
             return (self.uni.get(w4, 0) + add_k) / (self.total + add_k * V)
 
         probs = torch.tensor([get_prob(w) for w in cand], dtype=torch.float32)
-        probs = probs / (probs.sum() + 1e-12)
+        if probs.numel() > 0:
+            probs = probs / (probs.sum() + 1e-12)
+        else:
+            cand = ["the"]
+            probs = torch.ones(1)
+            
         return cand, probs
 
 
@@ -533,12 +597,8 @@ class NeuroSymbolicGraphGenerator:
         self.cache_version = 0
         self.radix_cache = RadixLRUCache(max_items=int(radix_cache_items))
 
-    def bump_cache_version(self):
-        self.cache_version += 1
-        self.radix_cache.clear()
-
     def _pick_initial_context(self, lm: QuadgramLM, seed_words: List[str]) -> Tuple[str, str, str]:
-        sw = [t for t in seed_words if re.match(r"^[a-z][a-z0-9_\-']*$", t)]
+        sw = [t for t in seed_words if re.match(r"^[a-z][a-z0-9_'-]*$", t) and t not in COGNITIVE_TOKENS]
         if len(sw) >= 3:
             return (sw[-3], sw[-2], sw[-1])
         if len(sw) == 2:
@@ -597,14 +657,16 @@ class NeuroSymbolicGraphGenerator:
     def build_state(self, text: str, progress=None) -> ModelState:
         if progress:
             progress(0, desc="Normalizing")
-        text = normalize(text)
-        docs = re.split(r"\n\s*\n", text)[:500]
+        
+        # Remove cognitive tokens for SVD calculation to keep spectral topics clean
+        clean_text = text.replace("[PROBLEM]", "").replace("[SOLUTION]", "")
+        docs = re.split(r"\n\s*\n", clean_text)[:500]
         X, vocab = pure_tfidf(docs, max_features=8000)
 
         if X.size == 0 or len(vocab) == 0:
             vocab100 = ["the", "is", "a"]
             probs = torch.tensor([0.34, 0.33, 0.33], dtype=torch.float32)
-            return ModelState([], vocab100, torch.zeros(0, 3), probs, {}, torch.zeros_like(probs), torch.zeros_like(probs), SimpleGraph([], []), None)
+            return ModelState([], vocab100, torch.zeros(0, 3), probs, {}, torch.zeros_like(probs), torch.zeros_like(probs), SimpleGraph([], [], {}), None)
 
         top_idx = np.argsort(-X.sum(axis=0))[: self.bars_n]
         vocab100 = [vocab[i] for i in top_idx]
@@ -644,15 +706,28 @@ class NeuroSymbolicGraphGenerator:
                 if len(subw) > 2 and subw not in STOP_WORDS:
                     token_boost[subw] = max(token_boost.get(subw, 0.0), math.log(p + 1e-12) + 5.0)
 
-        return ModelState(nodelets, vocab100, W, probs, token_boost, torch.zeros_like(probs), torch.zeros_like(probs), SimpleGraph([], []), None)
+        return ModelState(nodelets, vocab100, W, probs, token_boost, torch.zeros_like(probs), torch.zeros_like(probs), SimpleGraph([], [], {}), None)
 
     def prepare_corpus(self, text: str, progress=None) -> PreparedCorpus:
+        if progress:
+            progress(0.1, desc="Injecting Cognitive Tokens")
+        
+        # Inject markers
+        text = inject_cognitive_tokens(text)
         text = normalize(text)
+        
         state = self.build_state(text, progress)
         tokens = basic_tokenize(text)
         lm = QuadgramLM(self.lm_add_k)
         lm.ingest(tokens)
+        
+        # Manually boost the cognitive tokens in the system state
+        # so the fuzzy logic considers them high-priority landmarks
+        for tok, boost_val in COGNITIVE_TOKENS.items():
+            state.token_boost[tok] = boost_val
+            
         G = self._build_token_structure_graph(tokens)
+        state.semantic_graph = G
         ref_sig = self._graph_signature(G)
         return PreparedCorpus(text, tokens, lm, state, ref_sig)
 
@@ -685,9 +760,20 @@ class NeuroSymbolicGraphGenerator:
         # 2. Peak prob
         peak01 = base_p.max().clamp(0.0, 1.0)
 
-        # 3. Boost magnitude
+        # 3. Boost magnitude (checks if candidates align with high-value concepts)
         boosts = torch.tensor([prep.state.token_boost.get(w, 0.0) for w in cand], dtype=torch.float32).view(-1)
-        boost01 = torch.tanh(boosts.abs().mean() / 3.0).clamp(0.0, 1.0)
+        
+        # 4. Contextual Cognitive Gravity
+        # If we are near a [PROBLEM] or [SOLUTION] marker in the recent context,
+        # we increase boost intensity to simulate "staying on topic".
+        gravity = 0.0
+        context_str = f"{w1} {w2} {w3}"
+        if "[PROBLEM]" in context_str:
+            gravity = 0.2
+        if "[SOLUTION]" in context_str:
+            gravity = 0.3
+        
+        boost01 = torch.tanh((boosts.abs().mean() + gravity) / 3.0).clamp(0.0, 1.0)
 
         # Fuzzy Logic Control
         g = self.fuzzy_ctl(entropy01, peak01, boost01)
@@ -734,7 +820,6 @@ class ContinuousBatchDecoder:
         p = p / (float(p.sum()) + 1e-12)
 
         # Fuzzy-controlled Gaspare pruning
-        # Higher g (gain) -> tighter distribution -> stricter cutoff
         mu = float(np.mean(p))
         std = float(np.std(p))
         cutoff = mu + (1.0 - g) * std
@@ -810,7 +895,6 @@ def sg_gen_batched(ctxs, prompts, max_tokens=240, seed_offsets=None, stop_at_pun
     for i, (ctx, prompt) in enumerate(zip(ctxs, prompts)):
         off = seed_offsets[i] if seed_offsets else i
         local_seed = int(ctx.seed + off)
-        local_rng = np.random.default_rng(local_seed)  # kept (unused)
         seed_words = basic_tokenize(prompt.text)
         w1, w2, w3 = gen._pick_initial_context(prep.lm, seed_words)
         streams.append(DecodeStream(
@@ -834,8 +918,9 @@ def sg_fork(ctx, prompt, n):
 def sg_join(prompts, joiner="\n\n"):
     return SGPrompt(joiner.join(p.text for p in prompts))
 
+
 # ----------------------------
-# HF Dataset Loader (NEW)
+# HF Dataset Loader
 # ----------------------------
 
 _PREFER_TEXT_COLS = ["text", "content", "article", "body", "markdown", "md", "html", "raw"]
@@ -844,7 +929,6 @@ def _pick_text_column(ds_split) -> str:
     feats = ds_split.features
     string_cols = [k for k, v in feats.items() if isinstance(v, Value) and v.dtype == "string"]
     if not string_cols:
-        # Sometimes nested structs exist; you can extend this if needed.
         raise ValueError(f"No top-level string columns found. features={feats}")
 
     for pref in _PREFER_TEXT_COLS:
@@ -864,10 +948,7 @@ def load_hf_corpus(
     joiner: str = "\n\n",
     cache_dir: str = ".hf_cache"
 ) -> Tuple[str, Dict[str, Any]]:
-    """
-    Returns (corpus_text, meta)
-    max_rows=0 means "all".
-    """
+    
     ds = load_dataset(dataset_name, cache_dir=cache_dir)
     use_split = split_name if split_name in ds else next(iter(ds.keys()))
     split = ds[use_split]
@@ -893,21 +974,27 @@ def load_hf_corpus(
             if v:
                 parts.append(v)
 
-    corpus = joiner.join(parts)
+    raw_corpus = joiner.join(parts)
+    
+    # Analyze injection stats
+    cog_corpus = inject_cognitive_tokens(raw_corpus)
+    n_prob = len(re.findall(re.escape("[PROBLEM]"), cog_corpus))
+    n_sol = len(re.findall(re.escape("[SOLUTION]"), cog_corpus))
+
     meta = {
         "dataset": dataset_name,
         "split": use_split,
         "text_col": text_col,
         "rows_used": n_take,
-        "rows_nonempty": len(parts),
-        "chars": len(corpus),
-        "columns": list(split.column_names),
+        "chars": len(cog_corpus),
+        "problems_found": n_prob,
+        "solutions_found": n_sol
     }
-    return corpus, meta
+    return cog_corpus, meta
 
 
 # ----------------------------
-# Main program function (MODIFIED)
+# Main program function
 # ----------------------------
 
 def run_program(
@@ -930,13 +1017,24 @@ def run_program(
             max_rows=int(hf_max_rows) if hf_max_rows else 0,
         )
         header = (
-            f"[HF] dataset={meta['dataset']} split={meta['split']} text_col={meta['text_col']} "
-            f"rows_used={meta['rows_used']} nonempty={meta['rows_nonempty']} chars={meta['chars']}\n\n"
+            f"[HF DATASET] {meta['dataset']} (split: {meta['split']})\n"
+            f"Rows: {meta['rows_used']} | Chars: {meta['chars']}\n"
+            f"Cognitive Tokens: [PROBLEM]: {meta['problems_found']}, [SOLUTION]: {meta['solutions_found']}\n"
+            f"{'-'*40}\n\n"
         )
     else:
         path = _resolve_gradio_file_to_path(infile)
-        corpus_text = load_text(path)
-        header = f"[FILE] {Path(path).name} chars={len(corpus_text)}\n\n"
+        raw_text = load_text(path)
+        corpus_text = inject_cognitive_tokens(raw_text)
+        n_prob = len(re.findall(re.escape("[PROBLEM]"), corpus_text))
+        n_sol = len(re.findall(re.escape("[SOLUTION]"), corpus_text))
+        
+        header = (
+            f"[FILE] {Path(path).name}\n"
+            f"Chars: {len(corpus_text)}\n"
+            f"Cognitive Tokens: [PROBLEM]: {n_prob}, [SOLUTION]: {n_sol}\n"
+            f"{'-'*40}\n\n"
+        )
 
     gen = NeuroSymbolicGraphGenerator(
         steer_strength=float(steer),
@@ -962,21 +1060,21 @@ def run_program(
 
     merged = sg_join(branch_prompts, joiner="\n\n")
     final_prompt = SGPrompt(summary_prompt.replace("{joined_takeaways}", merged.text))
-    final_text = sg_gen_batched([ctx], [final_prompt], max_tokens=260)[0]
+    final_text = sg_gen_batched([ctx], [final_prompt], max_tokens=460)[0]
 
-    return header + final_prompt.text + final_text
+    return header + final_prompt.text + " " + final_text
 
 
 # ----------------------------
-# Gradio (MODIFIED)
+# Gradio
 # ----------------------------
 
 def build_app():
-    with gr.Blocks(title="Neurosymbolic V3.8 (Sugeno Fuzzy Logic) + HF Dataset") as demo:
+    with gr.Blocks(title="Neurosymbolic V3.9 + Cognitive Tokens") as demo:
         gr.Markdown(
-            "# Neurosymbolic V3.8: Sugeno Fuzzy Logic Control\n"
-            "*Logic gates (AND/OR) control inference dynamics. No neural gates. No Argmax.*\n\n"
-            "You can upload a corpus file **or** load a Hugging Face dataset."
+            "# Neurosymbolic V3.9: Sugeno Fuzzy Logic & Cognitive Tokens\n"
+            "**New Feature:** `[PROBLEM]` and `[SOLUTION]` tokens are automatically injected into the corpus. "
+            "These are non-generatable semantic landmarks that the fuzzy controller uses to steer inference."
         )
 
         with gr.Row():
@@ -1011,7 +1109,7 @@ def build_app():
             lines=4
         )
 
-        btn = gr.Button("Run Fuzzy Logic Generator", variant="primary")
+        btn = gr.Button("Run Neurosymbolic Generator", variant="primary")
         btn.click(
             run_program,
             inputs=[infile, use_hf, hf_dataset, hf_split, hf_max_rows, n_take, seed, steer, focus, p_takeaway, p_summary],

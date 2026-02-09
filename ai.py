@@ -905,7 +905,6 @@ class ContinuousBatchDecoder:
             s.tokens_out.append(next_token)
             s.w1, s.w2, s.w3 = s.w2, s.w3, next_token
             if re.match(r"[a-zA-Z]", next_token): s.alpha_count += 1
-            if next_token in s.stop_tokens and s.alpha_count >= s.min_alpha: s.done = True
             if len(s.tokens_out) >= s.max_steps: s.done = True
             steps_taken += 1
             active = [s for s in streams if not s.done]

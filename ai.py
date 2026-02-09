@@ -1098,7 +1098,7 @@ def build_app():
                     # NEW SLIDER REQUESTED
                     max_tokens = gr.Slider(10, 1000, value=250, step=10, label="Max Tokens Slider")
                     
-                    x_start = gr.Slider(0, 1, value=0.0, step=0.01, label="Start Position (x)")
+                    x_start = gr.Slider(0, 1, value=0.5, step=0.01, label="Start Position (x)")
                     
                     out_txt = gr.Textbox(label="Output", lines=22)
                     btn = gr.Button("Run generator", variant="primary")

@@ -1,27 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-Graph-Theoretic Neurosymbolic Text Generator with Neuronal Activator
-V5.0 - PyTorch Bootstrapping & Pairwise Symbolic Activation
+NeuroSymbolic V6.1 - Dynamic Flow & Token Control
+- Max Tokens Slider: Controls sequence length and x-axis advancement.
+- Neuronal Activator: Differentiable aesthetic weight generator.
+- Problem Flow Gradients: Positional scalars [0,1] modulate firing rates.
+- Key Transformations: Retains V4 quadgram logic, fuzzy gating, and cognitive tokens.
 
-Core Philosophy:
-Replaces static lookup tables with a trainable 'Neuronal Activator'. 
-This module bootstraps itself on the corpus structure, learning to fire 
-based on aesthetic symbol properties (Harmony, Density, Momentum, Resonance)
-encoded in a shared embedding space.
-
-New Features:
-1. NeuronalActivator (nn.Module): A learnable pairwise processor.
-2. PyTorch Bootstrapping: Pre-trains the activator on corpus bigrams to 
-   internalize symbolic rules before generation.
-3. Differentiable Aesthetics: Symbolic values are now continuous gradients.
-4. Osculating Fuzzy Control: Smooth 2nd-order membership functions.
-
-Dependencies:
+Deps:
   pip install gradio numpy torch datasets
 """
 
 from __future__ import annotations
+
 import re
 import math
 import hashlib
@@ -35,187 +27,40 @@ import gradio as gr
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.optim import Adam
-
 from datasets import load_dataset
 
+
 # ----------------------------
-# NEURONAL ACTIVATOR (PyTorch)
+# CORE SYMBOLIC ENGINE (Targets)
 # ----------------------------
 
-class NeuronalActivator(nn.Module):
-    """
-    A learnable module that replaces the static 'Chinese Room' engine.
-    It embeds tokens and fires based on pairwise aesthetic features.
-    
-    Bootstrapping Phase:
-    Before generation, this network trains on the corpus to learn 
-    classic symbolic rules (Harmony, Density, etc.), 'implanting' 
-    the rules into its weights.
-    """
-    def __init__(self, vocab_size=50000, embed_dim=64, hidden_dim=32):
-        super().__init__()
-        self.embed_dim = embed_dim
-        
-        # Shared token embedding
-        self.token_embed = nn.Embedding(vocab_size, embed_dim)
-        
-        # Projects concatenated pair embeddings to 4 latent aesthetic features
-        self.feature_proj = nn.Linear(embed_dim * 2, 4)
-        
-        # Neural firing mechanism (MLP)
-        self.neuron_mlp = nn.Sequential(
-            nn.Linear(4, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 1)
-        )
-        
-        # Global aesthetic state (learnable context)
-        self.register_buffer('global_mean', torch.zeros(4))
-        self.resonance_scale = nn.Parameter(torch.tensor(1.0))
-        
-        # Initialize weights
-        nn.init.xavier_normal_(self.feature_proj.weight)
-        nn.init.orthogonal_(self.neuron_mlp[0].weight)
+@dataclass
+class SymbolicPair:
+    token1: str
+    token2: str
+    harmony: float
+    density: float
+    momentum: float
+    resonance: float
 
-    def _hash_token(self, token: str) -> torch.Tensor:
-        """Deterministic hash for vocabulary management."""
-        h = int(hashlib.md5(token.encode()).hexdigest(), 16)
-        return torch.tensor(h % self.token_embed.num_embeddings, device=self.token_embed.weight.device)
-
-    def get_features(self, t1: str, t2: str) -> torch.Tensor:
-        """Compute the 4D aesthetic vector for a pair."""
-        with torch.no_grad():
-            idx1 = self._hash_token(t1)
-            idx2 = self._hash_token(t2)
-        
-        emb1 = self.token_embed(idx1)
-        emb2 = self.token_embed(idx2)
-        
-        # Concatenate and project to latent aesthetic space
-        concat = torch.cat([emb1, emb2])
-        raw_feats = self.feature_proj(concat)
-        
-        # Normalize to [0,1]
-        return torch.sigmoid(raw_feats)
-
-    def forward(self, t1: str, t2: str) -> Tuple[float, torch.Tensor]:
-        """
-        Returns:
-            firing_rate (float): 0.0-1.0 activation level
-            features (Tensor): 4D aesthetic vector
-        """
-        features = self.get_features(t1, t2)
-        
-        # Calculate deviation from global mean (Lateral Inhibition concept)
-        deviation = features - self.global_mean
-        
-        # Neuron firing logic
-        # Input is features + weighted deviation
-        neuron_in = features + (deviation * 0.5)
-        potential = self.neuron_mlp(neuron_in)
-        
-        firing_rate = torch.sigmoid(potential).item()
-        return firing_rate, features
-
-    def bootstrap(self, tokens: List[str], epochs: int = 50, lr: float = 0.01, progress=None):
-        """
-        Self-supervised training phase.
-        The network learns to predict the 'classic' symbolic rules 
-        from the raw token embeddings, essentially 'compiling' the 
-        rulebook into its neural weights.
-        """
-        if len(tokens) < 2:
-            return
-
-        optimizer = Adam(self.parameters(), lr=lr)
-        loss_fn = nn.MSELoss()
-        
-        # 1. Generate Training Data (Classic Rules)
-        pairs = []
-        targets = []
-        
-        seen = set()
-        
-        for i in range(len(tokens) - 1):
-            t1, t2 = tokens[i], tokens[i+1]
-            if (t1, t2) in seen: continue
-            seen.add((t1, t2))
-            
-            # --- Classic Symbolic Rules (Ground Truth) ---
-            # Harmony: Edit distance approximation
-            dist = self._levenshtein(t1, t2) / max(len(t1), len(t2), 1)
-            harmony = 1.0 - dist
-            
-            # Density
-            density = math.tanh((len(t1) + len(t2)) / 20.0)
-            
-            # Momentum
-            if len(t1) > 0:
-                m = (len(t2) - len(t1)) / (len(t1) + len(t2))
-                momentum = (m + 1.0) / 2.0
-            else:
-                momentum = 0.5
-                
-            # Resonance (Hash-based)
-            pair_str = f"{t1}|{t2}"
-            h_val = int(hashlib.md5(pair_str.encode()).hexdigest(), 16)
-            resonance = (h_val % 10000) / 10000.0
-            
-            pairs.append((t1, t2))
-            targets.append([harmony, density, momentum, resonance])
-            
-            if len(pairs) > 2000: # Limit bootstrap size
-                break
-        
-        target_tensor = torch.tensor(targets, dtype=torch.float32, device=self.token_embed.weight.device)
-        
-        # 2. Training Loop
-        self.train()
-        batch_size = 32
-        
-        for epoch in range(epochs):
-            total_loss = 0
-            indices = torch.randperm(len(pairs))
-            
-            for i in range(0, len(pairs), batch_size):
-                batch_idx = indices[i:i+batch_size]
-                batch_targets = target_tensor[batch_idx]
-                
-                # Get embeddings for batch
-                batch_t1_idx = torch.stack([self._hash_token(pairs[k][0]) for k in batch_idx])
-                batch_t2_idx = torch.stack([self._hash_token(pairs[k][1]) for k in batch_idx])
-                
-                emb1 = self.token_embed(batch_t1_idx)
-                emb2 = self.token_embed(batch_t2_idx)
-                
-                preds = torch.sigmoid(self.feature_proj(torch.cat([emb1, emb2], dim=1)))
-                
-                loss = loss_fn(preds, batch_targets)
-                
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                
-                total_loss += loss.item()
-            
-            if progress and epoch % 10 == 0:
-                progress(0.2 + (0.1 * epoch/epochs), desc=f"Bootstrapping Neurons (Loss: {total_loss:.4f})")
-
-        # 3. Update Global Mean based on corpus
-        with torch.no_grad():
-            self.eval()
-            all_feats = []
-            for t1, t2 in pairs:
-                all_feats.append(self.get_features(t1, t2))
-            if all_feats:
-                self.global_mean.data = torch.stack(all_feats).mean(dim=0)
+    @classmethod
+    def from_tokens(cls, t1: str, t2: str) -> "SymbolicPair":
+        harmony = 1.0 - (cls._edit_distance(t1, t2) / max(len(t1), len(t2), 1))
+        density = math.tanh((len(t1) + len(t2)) / 20.0)
+        if len(t1) > 0:
+            momentum = (len(t2) - len(t1)) / (len(t1) + len(t2))
+            momentum = (momentum + 1.0) / 2.0
+        else:
+            momentum = 0.5
+        pair_str = f"{t1}|{t2}"
+        hash_val = int(hashlib.md5(pair_str.encode()).hexdigest(), 16)
+        resonance = (hash_val % 10000) / 10000.0
+        return cls(t1, t2, harmony, density, momentum, resonance)
 
     @staticmethod
-    def _levenshtein(s1: str, s2: str) -> int:
+    def _edit_distance(s1: str, s2: str) -> int:
         if len(s1) < len(s2):
-            return NeuronalActivator._levenshtein(s2, s1)
+            return SymbolicPair._edit_distance(s2, s1)
         if len(s2) == 0:
             return len(s1)
         previous_row = range(len(s2) + 1)
@@ -229,8 +74,172 @@ class NeuronalActivator(nn.Module):
             previous_row = current_row
         return previous_row[-1]
 
+    def aesthetic_vector(self) -> np.ndarray:
+        return np.array([self.harmony, self.density, self.momentum, self.resonance], dtype=np.float32)
+
+
 # ----------------------------
-# CONSTANTS & COGNITIVE PATTERNS
+# DIFFERENTIABLE POSITION + ACTIVATOR
+# ----------------------------
+
+class NeuronalActivator(nn.Module):
+    """
+    Differentiable replacement for "pairwise cache weight":
+      (t1, t2, x_pos) -> predicted aesthetic vec (4) -> weight
+    Bootstraps on corpus bigrams by regressing to SymbolicPair aesthetics.
+    """
+    def __init__(self, vocab_size: int = 50000, emb_dim: int = 64, hidden: int = 96,
+                 pos_fourier: int = 16):
+        super().__init__()
+        self.vocab_size = int(vocab_size)
+        self.emb_dim = int(emb_dim)
+        self.pos_fourier = int(pos_fourier)
+
+        self.emb = nn.Embedding(self.vocab_size, self.emb_dim)
+
+        in_dim = 2 * self.emb_dim + 2 * self.pos_fourier  # token1, token2, sin/cos
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, 4),
+        )
+
+        self.register_buffer("global_mean4", torch.full((4,), 0.5, dtype=torch.float32))
+
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    @staticmethod
+    def _hash_token_to_id(tok: str, mod: int) -> int:
+        h = int(hashlib.md5(tok.encode()).hexdigest(), 16)
+        return int(h % mod)
+
+    def token_ids(self, toks: List[str], device: torch.device) -> torch.LongTensor:
+        ids = [self._hash_token_to_id(t, self.vocab_size) for t in toks]
+        return torch.tensor(ids, dtype=torch.long, device=device)
+
+    def _pos_fourier(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: shape [] or [B], in [0,1]
+        returns: [B, 2*pos_fourier]
+        """
+        if x.dim() == 0:
+            x = x.view(1)
+        freqs = torch.arange(1, self.pos_fourier + 1, device=x.device, dtype=x.dtype) * (2.0 * math.pi)
+        ang = x.view(-1, 1) * freqs.view(1, -1)
+        return torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1)
+
+    def predict_vec4(self, t1_ids: torch.LongTensor, t2_ids: torch.LongTensor, x_pos: torch.Tensor) -> torch.Tensor:
+        """
+        t1_ids: [B]
+        t2_ids: [B]
+        x_pos:  [] or [B] in [0,1]
+        returns vec4: [B,4] in [0,1] (sigmoid)
+        """
+        e1 = self.emb(t1_ids)
+        e2 = self.emb(t2_ids)
+        pf = self._pos_fourier(x_pos.to(dtype=e1.dtype))
+        if pf.shape[0] != e1.shape[0]:
+            pf = pf.expand(e1.shape[0], -1)
+        z = torch.cat([e1, e2, pf], dim=-1)
+        vec4 = torch.sigmoid(self.mlp(z))
+        return vec4
+
+    def weight_from_vec4(self, vec4: torch.Tensor) -> torch.Tensor:
+        """
+        vec4: [B,4], global_mean4: [4]
+        returns weight: [B]
+        """
+        d = torch.linalg.norm(vec4 - self.global_mean4.view(1, 4), dim=-1)
+        return torch.exp(-d)
+
+    @torch.no_grad()
+    def update_global_mean(self, vec4_all: torch.Tensor):
+        self.global_mean4.copy_(vec4_all.mean(dim=0).clamp(0.0, 1.0))
+
+    def forward_weight(self, t1: str, t2_list: List[str], x_pos: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Convenience: t1 string + list of t2 strings -> (weights[B], vec4[B,4])
+        """
+        device = self.emb.weight.device
+        t1_ids = self.token_ids([t1] * len(t2_list), device=device)
+        t2_ids = self.token_ids(t2_list, device=device)
+        vec4 = self.predict_vec4(t1_ids, t2_ids, x_pos=x_pos)
+        w = self.weight_from_vec4(vec4)
+        return w, vec4
+
+    def bootstrap_on_tokens(self, tokens: List[str], epochs: int = 25, lr: float = 3e-3,
+                            max_pairs: int = 4000, progress=None) -> Dict[str, float]:
+        """
+        Supervised bootstrap:
+          input: (t_i, t_{i+1}, x_pos=i/(N-1))
+          target: SymbolicPair aesthetics vec4
+        """
+        if len(tokens) < 2:
+            return {"pairs": 0, "loss": 0.0}
+
+        # Build unique pairs with positions
+        N = len(tokens)
+        pairs = []
+        for i in range(N - 1):
+            t1, t2 = tokens[i], tokens[i + 1]
+            if t1 in COGNITIVE_TOKENS or t2 in COGNITIVE_TOKENS:
+                continue
+            x = float(i / max(1, (N - 2)))
+            pairs.append((t1, t2, x))
+            if len(pairs) >= max_pairs:
+                break
+
+        if not pairs:
+            return {"pairs": 0, "loss": 0.0}
+
+        # Targets from V4 SymbolicPair
+        y = torch.tensor([SymbolicPair.from_tokens(a, b).aesthetic_vector() for a, b, _ in pairs], dtype=torch.float32)
+        self.update_global_mean(y)
+
+        device = self.emb.weight.device
+        t1_ids = self.token_ids([a for a, _, _ in pairs], device=device)
+        t2_ids = self.token_ids([b for _, b, _ in pairs], device=device)
+        x_pos = torch.tensor([x for _, _, x in pairs], dtype=torch.float32, device=device)
+
+        y = y.to(device=device)
+
+        opt = torch.optim.AdamW(self.parameters(), lr=lr, weight_decay=1e-4)
+        loss_fn = nn.MSELoss()
+
+        self.train()
+        bs = 128
+        losses = []
+
+        for ep in range(int(epochs)):
+            perm = torch.randperm(len(pairs), device=device)
+            ep_loss = 0.0
+            for k in range(0, len(pairs), bs):
+                idx = perm[k:k+bs]
+                pred = self.predict_vec4(t1_ids[idx], t2_ids[idx], x_pos[idx])
+                loss = loss_fn(pred, y[idx])
+
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                opt.step()
+                ep_loss += float(loss.item())
+
+            losses.append(ep_loss / max(1, math.ceil(len(pairs) / bs)))
+            if progress and (ep == 0 or (ep + 1) % 5 == 0):
+                progress(0.10 + 0.15 * (ep + 1) / max(1, epochs), desc=f"Bootstrapping activator (loss {losses[-1]:.4f})")
+
+        self.eval()
+        return {"pairs": len(pairs), "loss": float(losses[-1]) if losses else 0.0}
+
+
+# ----------------------------
+# V4 CONSTANTS / PATTERNS
 # ----------------------------
 
 COGNITIVE_TOKENS = {
@@ -262,13 +271,14 @@ SOLUTION_PATTERNS = [
     r"(?:this|it)\s+(?:can|may|might|should|will)\s+be\s+(?:solved|addressed|resolved)\s+(?:by|using|with)",
 ]
 
+
 # ----------------------------
-# Text Processing & Utilities
+# TEXT PROCESSING
 # ----------------------------
 
 def inject_cognitive_tokens(text: str) -> str:
-    lines = text.split('\n')
-    marked_lines = []
+    lines = text.split("\n")
+    marked = []
     for i, line in enumerate(lines):
         orig_line = line
         modified = False
@@ -282,15 +292,11 @@ def inject_cognitive_tokens(text: str) -> str:
                 if re.search(pat, line, re.IGNORECASE):
                     line = f"[PROBLEM] {line}"
                     break
-        marked_lines.append(line)
-    return '\n'.join(marked_lines)
-
-def _token_class(tok: str) -> str:
-    if tok in COGNITIVE_TOKENS: return "COG"
-    if tok in [".", ",", ";", ":", "!", "?", "(", ")"]: return "PUNC"
-    if not re.match(r"[a-z]", tok): return "OTHER"
-    L = len(tok)
-    return "S" if L <= 3 else "M" if L <= 7 else "L"
+        if i > 0 and marked and ("?" in marked[-1]) and ("[SOLUTION]" not in line):
+            if any(w in orig_line.lower() for w in ["answer", "solution", "because", "since", "therefore"]):
+                line = f"[SOLUTION] {line}"
+        marked.append(line)
+    return "\n".join(marked)
 
 def normalize(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -314,15 +320,21 @@ def basic_tokenize(text: str) -> List[str]:
 def detokenize(tokens: List[str]) -> str:
     out = []
     for t in tokens:
-        if t in COGNITIVE_TOKENS: continue
+        if t in COGNITIVE_TOKENS:
+            continue
         if t in [".", ",", ";", ":", "!", "?", ")", "("]:
-            if t in ["(", ")"]: out.append(t)
+            if t in ["(", ")"]:
+                out.append(t)
             else:
-                if out: out[-1] += t
-                else: out.append(t)
+                if out:
+                    out[-1] += t
+                else:
+                    out.append(t)
         else:
-            if out and out[-1].endswith("("): out[-1] += t
-            else: out.append(t)
+            if out and out[-1].endswith("("):
+                out[-1] += t
+            else:
+                out.append(t)
     s = " ".join(out)
     s = re.sub(r"\(\s+", "(", s)
     s = re.sub(r"\s+\)", ")", s)
@@ -331,21 +343,59 @@ def detokenize(tokens: List[str]) -> str:
 
 def load_text(path: str) -> str:
     p = Path(path)
-    if not p.exists(): raise FileNotFoundError(f"File not found: {p}")
+    if not p.exists():
+        raise FileNotFoundError(f"File not found: {p}")
     if p.suffix.lower() in [".txt", ".md"]:
         return p.read_text(encoding="utf-8", errors="replace")
     raise ValueError("Unsupported file extension")
 
 def _resolve_gradio_file_to_path(infile) -> str:
-    if infile is None: raise ValueError("No input file provided.")
-    if isinstance(infile, str): return infile
-    if hasattr(infile, "name") and isinstance(infile.name, str): return infile.name
-    if isinstance(infile, dict) and "path" in infile: return str(infile["path"])
-    if hasattr(infile, "path"): return str(infile.path)
+    if infile is None:
+        raise ValueError("No input file provided.")
+    if isinstance(infile, str):
+        return infile
+    if hasattr(infile, "name") and isinstance(infile.name, str):
+        return infile.name
+    if isinstance(infile, dict) and "path" in infile:
+        return str(infile["path"])
+    if hasattr(infile, "path"):
+        return str(infile.path)
     raise ValueError(f"Unsupported infile type: {type(infile)}")
 
+
 # ----------------------------
-# Pure-Python TF-IDF + SVD
+# PROBLEM FLOW FIELD (token -> [0,1])
+# ----------------------------
+
+def compute_problem_flow_by_token(tokens: List[str]) -> Dict[str, float]:
+    """
+    Estimate token's typical position between [PROBLEM] and [SOLUTION].
+    0=near problem start, 1=near solution marker.
+    """
+    acc: Dict[str, List[float]] = {}
+    in_seg = False
+    seg_start = None
+    for i, tok in enumerate(tokens):
+        if tok == "[PROBLEM]":
+            in_seg = True
+            seg_start = i
+        elif tok == "[SOLUTION]" and in_seg and seg_start is not None:
+            seg_end = i
+            L = seg_end - seg_start
+            if L > 1:
+                for j in range(seg_start + 1, seg_end):
+                    t = tokens[j]
+                    if t in COGNITIVE_TOKENS:
+                        continue
+                    pos = (j - seg_start) / max(1, L)
+                    acc.setdefault(t, []).append(float(pos))
+            in_seg = False
+            seg_start = None
+    return {t: float(sum(v) / len(v)) for t, v in acc.items()}
+
+
+# ----------------------------
+# PURE TF-IDF + SVD (as in V4)
 # ----------------------------
 
 def pure_tfidf(docs: List[str], max_features: int = 8000) -> Tuple[np.ndarray, List[str]]:
@@ -355,12 +405,14 @@ def pure_tfidf(docs: List[str], max_features: int = 8000) -> Tuple[np.ndarray, L
         all_words.update(words)
     vocab = list(all_words)[:max_features]
     word_to_idx = {w: i for i, w in enumerate(vocab)}
-    X = np.zeros((len(docs), len(vocab)))
+
+    X = np.zeros((len(docs), len(vocab)), dtype=np.float32)
     for i, doc in enumerate(docs):
         word_counts = {}
         for word in re.findall(r"\b\w+\b", doc.lower()):
             word_counts[word] = word_counts.get(word, 0) + 1
-        if not word_counts: continue
+        if not word_counts:
+            continue
         uniq = len(word_counts)
         for word, count in word_counts.items():
             if word in word_to_idx:
@@ -375,18 +427,23 @@ def pure_truncated_svd(X: np.ndarray, n_components: int, random_state: int = 42)
     np.random.seed(random_state)
     m, n = X.shape
     k = min(n_components, min(m, n))
-    if k < 1: return type("SVD", (), {"components_": np.zeros((0, n))})()
-    Q = np.random.randn(n, k)
+    if k < 1:
+        return type("SVD", (), {"components_": np.zeros((0, n), dtype=np.float32)})()
+
+    Q = np.random.randn(n, k).astype(np.float32)
     Q, _ = np.linalg.qr(Q)
+
     for _ in range(10):
         B = X.T @ X @ Q
         Q, _ = np.linalg.qr(B)
+
     B = X @ Q
     U, S, Vt = np.linalg.svd(B, full_matrices=False)
-    return type("SVD", (), {"components_": Vt[:k]})()
+    return type("SVD", (), {"components_": Vt[:k].astype(np.float32)})()
+
 
 # ----------------------------
-# Graph Components
+# GRAPH (stores predicted vec4 for edges)
 # ----------------------------
 
 @dataclass
@@ -394,88 +451,55 @@ class SimpleGraph:
     nodes: List[Dict[str, Any]]
     edges: List[Tuple[int, int, Dict[str, Any]]]
     cognitive_map: Dict[str, List[int]]
-    pairwise_aesthetics: Dict[Tuple[int, int], torch.Tensor]
+    pairwise_aesthetics: Dict[Tuple[int, int], torch.Tensor]  # vec4 on each adj edge
 
     @classmethod
-    def from_token_sequence(cls, tokens: List[str], activator: NeuronalActivator, max_nodes: int = 220):
+    def from_token_sequence(cls, tokens: List[str], activator: NeuronalActivator,
+                            max_nodes: int = 220, x_pos_default: float = 0.5):
         toks = tokens[:max_nodes]
-        nodes = [{"id": i, "cls": _token_class(t), "token": t} for i, t in enumerate(toks)]
+        nodes = [{"id": i, "token": t} for i, t in enumerate(toks)]
         edges = []
         cog_map = {"[PROBLEM]": [], "[SOLUTION]": [], "[PAIR-BEGIN]": [], "[PAIR-END]": []}
-        pairwise_aesthetics = {}
+        aest = {}
 
-        # Process edges with Neuronal Activator
-        for i in range(len(toks) - 1):
-            edge_data = {"rel": "adj"}
-            edges.append((i, i + 1, edge_data))
-            
-            # Use trained activator to get features
-            _, features = activator(toks[i], toks[i+1])
-            pairwise_aesthetics[(i, i+1)] = features.detach().cpu()
-        
+        # Use activator to predict vec4 per adjacent pair
+        if len(toks) >= 2:
+            device = activator.emb.weight.device
+            x = torch.tensor(float(x_pos_default), dtype=torch.float32, device=device)
+            for i in range(len(toks) - 1):
+                edges.append((i, i + 1, {"rel": "adj"}))
+                t1, t2 = toks[i], toks[i + 1]
+                w, vec4 = activator.forward_weight(t1, [t2], x_pos=x)
+                aest[(i, i + 1)] = vec4[0].detach().cpu()
+
         for i in range(len(toks) - 2):
             edges.append((i, i + 2, {"rel": "skip"}))
-        
+
         for i, t in enumerate(toks):
             if t in COGNITIVE_TOKENS:
                 cog_map[t].append(i)
 
-        return cls(nodes, edges, cog_map, pairwise_aesthetics)
+        return cls(nodes, edges, cog_map, aest)
 
     def get_aesthetic_flow(self) -> float:
         if not self.pairwise_aesthetics:
             return 0.5
-        vectors = list(self.pairwise_aesthetics.values())
-        if not vectors: return 0.5
-        stacked = torch.stack(vectors)
-        return float(torch.mean(torch.norm(stacked, dim=1)).item())
+        vecs = list(self.pairwise_aesthetics.values())
+        if not vecs:
+            return 0.5
+        V = torch.stack(vecs, dim=0)  # [E,4]
+        return float(torch.mean(torch.linalg.norm(V, dim=1)).item())
 
-    # Standard metrics
-    def degree_histogram(self, max_bins: int = 16) -> np.ndarray:
-        degrees = [0] * max_bins
-        node_deg = {node["id"]: 0 for node in self.nodes}
-        for u, v, _ in self.edges:
-            node_deg[u] += 1
-            node_deg[v] += 1
-        for d in node_deg.values():
-            if d < max_bins: degrees[d] += 1
-        return np.array(degrees)
-
-    def weisfeiler_lehman_hash(self, iterations: int = 3, digest_size: int = 16) -> str:
-        labels = {node["id"]: node["cls"] for node in self.nodes}
-        adj = {node["id"]: [] for node in self.nodes}
-        for u, v, _ in self.edges:
-            adj[u].append(v); adj[v].append(u)
-        for _ in range(iterations):
-            new_labels = {}
-            for node_id in labels:
-                neighbors = sorted([labels[n] for n in adj[node_id]])
-                combined = (labels[node_id],) + tuple(neighbors)
-                new_hash = hash(combined) % (10**digest_size)
-                new_labels[node_id] = f"{labels[node_id]}_{new_hash}"
-            labels = new_labels
-        final_hash = sum(hash((k, labels[k])) for k in labels) % (10**digest_size)
-        return f"{final_hash:0{digest_size}d}"
-
-    def automorphism_estimate(self, max_count: int = 150) -> int:
-        labels = {node["id"]: node["cls"] for node in self.nodes}
-        counts = {}
-        for l in labels.values(): counts[l] = counts.get(l, 0) + 1
-        prod = 1
-        for c in counts.values(): prod *= c
-        return min(max_count, prod)
 
 def graph_signature(G: SimpleGraph) -> Dict[str, object]:
     return {
-        "deg_hist": G.degree_histogram(),
-        "wl": G.weisfeiler_lehman_hash(),
-        "aut_est": G.automorphism_estimate(),
         "cognitive_density": sum(len(v) for v in G.cognitive_map.values()),
         "aesthetic_flow": G.get_aesthetic_flow(),
     }
 
+
 # ----------------------------
-# Fuzzy Logic Controller
+# FUZZY CONTROLLER (differentiable)
 # ----------------------------
 
 def mf_tri(x: torch.Tensor, a: float, b: float, c: float) -> torch.Tensor:
@@ -491,31 +515,40 @@ def mf_trap(x: torch.Tensor, a: float, b: float, c: float, d: float) -> torch.Te
     one = torch.tensor(1.0, device=x.device, dtype=x.dtype)
     return torch.clamp(torch.minimum(torch.minimum(up, one), down), 0.0, 1.0)
 
-def tnorm_prod(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor: return a * b
-def snorm_max(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor: return torch.maximum(a, b)
+def tnorm_prod(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    return a * b
+
+def snorm_max(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    return torch.maximum(a, b)
 
 class FuzzyWeightController(nn.Module):
     def __init__(self):
         super().__init__()
-        self.z_low, self.z_mid, self.z_high = 0.20, 0.55, 0.95
+        self.z_low = 0.20
+        self.z_mid = 0.55
+        self.z_high = 0.95
 
-    @torch.no_grad()
     def forward(self, entropy01: torch.Tensor, peak01: torch.Tensor,
-                boost01: torch.Tensor, aesthetic_flow: float = 0.5,
+                boost01: torch.Tensor, aesthetic_flow01: torch.Tensor,
                 osculator_strength: float = 0.0) -> torch.Tensor:
-        e, p, b = entropy01.clamp(0, 1), peak01.clamp(0, 1), boost01.clamp(0, 1)
-        a = torch.tensor(aesthetic_flow, device=e.device).clamp(0, 1)
-        
+        e = entropy01.clamp(0, 1)
+        p = peak01.clamp(0, 1)
+        b = boost01.clamp(0, 1)
+        a = aesthetic_flow01.clamp(0, 1)
+
         # Memberships
-        e_low = mf_trap(e, 0.0, 0.0, 0.25, 0.45)
-        e_mid = mf_tri(e, 0.25, 0.50, 0.75)
+        e_low  = mf_trap(e, 0.0, 0.0, 0.25, 0.45)
+        e_mid  = mf_tri(e, 0.25, 0.50, 0.75)
         e_high = mf_trap(e, 0.55, 0.75, 1.0, 1.0)
-        p_low = mf_trap(p, 0.0, 0.0, 0.20, 0.40)
-        p_mid = mf_tri(p, 0.25, 0.50, 0.75)
+
+        p_low  = mf_trap(p, 0.0, 0.0, 0.20, 0.40)
+        p_mid  = mf_tri(p, 0.25, 0.50, 0.75)
         p_high = mf_trap(p, 0.60, 0.80, 1.0, 1.0)
-        b_low = mf_trap(b, 0.0, 0.0, 0.20, 0.45)
-        b_mid = mf_tri(b, 0.25, 0.50, 0.75)
+
+        b_low  = mf_trap(b, 0.0, 0.0, 0.20, 0.45)
+        b_mid  = mf_tri(b, 0.25, 0.50, 0.75)
         b_high = mf_trap(b, 0.55, 0.80, 1.0, 1.0)
+
         a_high = mf_trap(a, 0.5, 0.7, 1.0, 1.0)
 
         # Rules
@@ -525,21 +558,24 @@ class FuzzyWeightController(nn.Module):
         w4 = tnorm_prod(e_low, p_mid)
         w5 = tnorm_prod(a_high, e_mid)
 
-        Z = torch.tensor([self.z_high, self.z_mid, self.z_low, self.z_low, self.z_high], 
-                        device=e.device).float()
-        W = torch.stack([w1, w2, w3, w4, w5]).float().clamp_min(0.0)
+        Z = torch.tensor([self.z_high, self.z_mid, self.z_low, self.z_low, self.z_high],
+                         device=e.device, dtype=torch.float32)
+        W = torch.stack([w1, w2, w3, w4, w5]).to(dtype=torch.float32).clamp_min(0.0)
 
         g = (W * Z).sum() / (W.sum() + 1e-12)
-        
-        # Osculating modification (Smooth 2nd order blend)
-        if osculator_strength > 0.05:
-            osc_val = 1.0 - ((g - 0.5) / 0.5).pow(2) # Parabola centered at 0.5
-            g = (1.0 - osculator_strength) * g + osculator_strength * osc_val
-            
+
+        s = float(osculator_strength)
+        if math.isfinite(s) and s > 0.0:
+            s = max(0.0, min(1.0, s))
+            osc = 1.0 - ((g - 0.5) / 0.5) ** 2
+            osc = osc.clamp(0.0, 1.0)
+            g = (1.0 - s) * g + s * osc
+
         return g.clamp(0.0, 0.5)
 
+
 # ----------------------------
-# Neural Modules
+# OTHER NEURAL UTILITIES
 # ----------------------------
 
 class LateralInhibition(nn.Module):
@@ -551,25 +587,22 @@ class LateralInhibition(nn.Module):
         self.pad = int(kernel_size // 2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dim() == 1: x = x.view(1, 1, -1)
-        elif x.dim() == 2: x = x.view(x.shape[0], 1, x.shape[1])
+        if x.dim() == 1:
+            x = x.view(1, 1, -1)
+        elif x.dim() == 2:
+            x = x.view(x.shape[0], 1, x.shape[1])
         modulation = F.conv1d(x, self.kernel, padding=self.pad)
         out = x + self.strength * modulation
         out = F.relu(out)
         return out / (out.sum(dim=-1, keepdim=True) + 1e-12)
 
-class SynapticPruner(nn.Module):
-    def __init__(self, n_features: int):
-        super().__init__()
-        self.gain = nn.Parameter(torch.ones(int(n_features)))
-    def forward(self, W: torch.Tensor) -> torch.Tensor: return W * self.gain.view(1, -1)
 
 # ----------------------------
-# Quadgram LM
+# QUADGRAM LM (counts)
 # ----------------------------
 
 class QuadgramLM:
-    def __init__(self, add_k: float = 0.25, activator: Optional[NeuronalActivator] = None):
+    def __init__(self, add_k: float = 0.25):
         self.add_k = float(add_k)
         self.uni: Dict[str, int] = {}
         self.bi: Dict[Tuple[str, str], int] = {}
@@ -577,40 +610,47 @@ class QuadgramLM:
         self.quad: Dict[Tuple[str, str, str, str], int] = {}
         self.vocab: List[str] = []
         self.total = 0
-        self.activator = activator
 
     def ingest(self, tokens: List[str]) -> None:
         self.uni.clear(); self.bi.clear(); self.tri.clear(); self.quad.clear()
         self.total = 0
         for t in tokens:
-            self.uni[t] = self.uni.get(t, 0) + 1; self.total += 1
+            self.uni[t] = self.uni.get(t, 0) + 1
+            self.total += 1
         for i in range(len(tokens) - 1):
-            k = (tokens[i], tokens[i+1]); self.bi[k] = self.bi.get(k, 0) + 1
+            k = (tokens[i], tokens[i + 1])
+            self.bi[k] = self.bi.get(k, 0) + 1
         for i in range(len(tokens) - 2):
-            k = (tokens[i], tokens[i+1], tokens[i+2]); self.tri[k] = self.tri.get(k, 0) + 1
+            k = (tokens[i], tokens[i + 1], tokens[i + 2])
+            self.tri[k] = self.tri.get(k, 0) + 1
         for i in range(len(tokens) - 3):
-            k = (tokens[i], tokens[i+1], tokens[i+2], tokens[i+3]); self.quad[k] = self.quad.get(k, 0) + 1
+            k = (tokens[i], tokens[i + 1], tokens[i + 2], tokens[i + 3])
+            self.quad[k] = self.quad.get(k, 0) + 1
         self.vocab = list(self.uni.keys())
 
-    def next_distribution(self, w1: str, w2: str, w3: str) -> Tuple[List[str], torch.Tensor, List[float]]:
+    def next_distribution(self, w1: str, w2: str, w3: str) -> Tuple[List[str], torch.Tensor]:
         cont = []
-        for (a, b, c, d), count in self.quad.items():
-            if a == w1 and b == w2 and c == w3: cont.append(d)
+        for (a, b, c, d), _count in self.quad.items():
+            if a == w1 and b == w2 and c == w3:
+                cont.append(d)
         if not cont:
-            for (a, b, c), count in self.tri.items():
-                if a == w2 and b == w3: cont.append(c)
+            for (a, b, c), _count in self.tri.items():
+                if a == w2 and b == w3:
+                    cont.append(c)
         if not cont:
-            for (a, b), count in self.bi.items():
-                if a == w3: cont.append(b)
+            for (a, b), _count in self.bi.items():
+                if a == w3:
+                    cont.append(b)
         if not cont:
-            cont = [w for w, _ in sorted(self.uni.items(), key=lambda x: x[1], reverse=True)]
+            cont = [w for w, _ in sorted(self.uni.items(), key=lambda x: x[1], reverse=True)[:200]]
 
         seen = set()
         cand = []
         for w in cont:
             if w not in seen and w not in COGNITIVE_TOKENS:
-                seen.add(w); cand.append(w)
-        cand = cand
+                seen.add(w)
+                cand.append(w)
+        cand = cand[:500]
 
         V = len(self.vocab) + 1
         add_k = self.add_k
@@ -618,37 +658,37 @@ class QuadgramLM:
         def get_prob(w4: str) -> float:
             c123 = self.tri.get((w1, w2, w3), 0)
             c1234 = self.quad.get((w1, w2, w3, w4), 0)
-            if c123 > 0: return (c1234 + add_k) / (c123 + add_k * V)
+            if c123 > 0:
+                return (c1234 + add_k) / (c123 + add_k * V)
             c12 = self.bi.get((w2, w3), 0)
             c123_tri = self.tri.get((w2, w3, w4), 0)
-            if c12 > 0: return (c123_tri + add_k) / (c12 + add_k * V)
+            if c12 > 0:
+                return (c123_tri + add_k) / (c12 + add_k * V)
             c1 = self.uni.get(w3, 0)
             c12_bi = self.bi.get((w3, w4), 0)
-            if c1 > 0: return (c12_bi + add_k) / (c1 + add_k * V)
+            if c1 > 0:
+                return (c12_bi + add_k) / (c1 + add_k * V)
             return (self.uni.get(w4, 0) + add_k) / (self.total + add_k * V)
 
         probs = torch.tensor([get_prob(w) for w in cand], dtype=torch.float32)
-        if probs.numel() > 0: probs = probs / (probs.sum() + 1e-12)
-        else: cand = ["the"]; probs = torch.ones(1)
-        
-        # Get pairwise firing rates from Neuronal Activator
-        pair_weights = []
-        if self.activator:
-            for w4 in cand:
-                fire, _ = self.activator(w3, w4)
-                pair_weights.append(fire)
+        if probs.numel() > 0:
+            probs = probs / (probs.sum() + 1e-12)
         else:
-            pair_weights = [1.0] * len(cand)
-            
-        return cand, probs, pair_weights
+            cand = ["the"]
+            probs = torch.ones(1, dtype=torch.float32)
+        return cand, probs
+
 
 # ----------------------------
-# System State
+# STATE & CACHE
 # ----------------------------
 
 @dataclass
 class Nodelet:
-    idx: int; top_terms: List[Tuple[str, float]]; energy: float; narrative: str
+    idx: int
+    top_terms: List[Tuple[str, float]]
+    energy: float
+    narrative: str
 
 @dataclass
 class ModelState:
@@ -657,364 +697,437 @@ class ModelState:
     binding_W: torch.Tensor
     bar_probs: torch.Tensor
     token_boost: Dict[str, float]
-    pillar_weights: torch.Tensor
-    geometric_bias: torch.Tensor
     semantic_graph: SimpleGraph
-    lm_graph: Any
+    lm: QuadgramLM
     activator: NeuronalActivator
+    problem_flow_by_token: Dict[str, float]
 
 @dataclass
 class PreparedCorpus:
-    text: str; tokens: List[str]; lm: QuadgramLM; state: ModelState; ref_sig: Dict[str, object]
+    text: str
+    tokens: List[str]
+    state: ModelState
+
 
 class RadixLRUCache:
     def __init__(self, max_items: int = 25000):
         self.max_items = int(max(256, max_items))
         self._od = OrderedDict()
+
     def get(self, key):
         v = self._od.get(key, None)
-        if v is None: return None
+        if v is None:
+            return None
         self._od.move_to_end(key)
         return v
+
     def put(self, key, value):
         self._od[key] = value
         self._od.move_to_end(key)
-        if len(self._od) > self.max_items: self._od.popitem(last=False)
-    def clear(self): self._od.clear()
+        if len(self._od) > self.max_items:
+            self._od.popitem(last=False)
+
+    def clear(self):
+        self._od.clear()
+
 
 # ----------------------------
-# NeuroSymbolicGraphGenerator
+# GENERATOR (keeps V4 logic, adds x_pos tensor)
 # ----------------------------
 
 class NeuroSymbolicGraphGenerator:
-    def __init__(
-        self, nodelets_n=10, bars_n=100, svd_random_state=7, softmax_temp=0.85,
-        steer_strength=1.35, lm_add_k=0.25, pillar_strength=0.85, geometric_strength=0.3,
-        rfe_enabled=True, rfe_iterations=3, rfe_removal_rate=0.15, focus_strength=0.5,
-        radix_cache_items=25000, pairwise_strength=0.4, osculator_strength=0.1
-    ):
+    def __init__(self,
+                 nodelets_n: int = 10,
+                 bars_n: int = 100,
+                 svd_random_state: int = 7,
+                 softmax_temp: float = 0.85,
+                 steer_strength: float = 1.35,
+                 lm_add_k: float = 0.25,
+                 focus_strength: float = 0.5,
+                 pairwise_strength: float = 0.4,
+                 osculator_strength: float = 0.1,
+                 activator_boot_epochs: int = 25):
         self.nodelets_n = int(nodelets_n)
         self.bars_n = int(bars_n)
         self.svd_random_state = int(svd_random_state)
-        self.softmax_temp, self.lm_add_k = float(softmax_temp), float(lm_add_k)
-        self.pillar_strength, self.geometric_strength = float(pillar_strength), float(geometric_strength)
-        self.rfe_enabled, self.rfe_iterations = bool(rfe_enabled), int(rfe_iterations)
-        self.rfe_removal_rate = float(rfe_removal_rate)
+        self.softmax_temp = float(softmax_temp)
+        self.lm_add_k = float(lm_add_k)
+        self.base_steer = float(steer_strength)
+        self.base_temp = float(softmax_temp)
         self.pairwise_strength = float(pairwise_strength)
         self.osculator_strength = float(osculator_strength)
-        self.base_steer, self.base_temp = float(steer_strength), float(softmax_temp)
-        
+        self.activator_boot_epochs = int(activator_boot_epochs)
+
         self.focus_layer = LateralInhibition(strength=float(focus_strength))
         self.fuzzy_ctl = FuzzyWeightController()
-        self.pruner = None
+
+        self.cache = RadixLRUCache(max_items=20000)
         self.cache_version = 0
-        self.radix_cache = RadixLRUCache(max_items=int(radix_cache_items))
 
     def _pick_initial_context(self, lm: QuadgramLM, seed_words: List[str]) -> Tuple[str, str, str]:
         sw = [t for t in seed_words if re.match(r"^[a-z][a-z0-9_'-]*$", t) and t not in COGNITIVE_TOKENS]
-        if len(sw) >= 3: return (sw[-3], sw[-2], sw[-1])
-        if len(sw) == 2: return (sw[-2], sw[-1], sw[-1])
-        if len(sw) == 1: return (sw[-1], sw[-1], sw[-1])
+        if len(sw) >= 3:
+            return (sw[-3], sw[-2], sw[-1])
+        if len(sw) == 2:
+            return (sw[-2], sw[-1], sw[-1])
+        if len(sw) == 1:
+            return (sw[-1], sw[-1], sw[-1])
         seed_tok = lm.vocab[0] if lm.vocab else "the"
         return (seed_tok, seed_tok, seed_tok)
 
-    def _synaptic_prune(self, W: torch.Tensor, energies: torch.Tensor, vocab100: List[str], progress=None):
-        if not self.rfe_enabled or self.rfe_iterations <= 0: return W, vocab100
-        k, bars_n = W.shape
-        self.pruner = SynapticPruner(bars_n)
-        W_curr = W.detach().clone().requires_grad_(True)
-        kept_mask = torch.ones(bars_n, dtype=torch.bool)
-
-        for iteration in range(self.rfe_iterations):
-            if progress: progress(0.80 + 0.05 * (iteration / max(1, self.rfe_iterations)), desc=f"Synaptic Pruning {iteration+1}")
-            W_modulated = self.pruner(W_curr)
-            var_term = 0.0
-            if W_modulated.size(0) >= 2: var_term = torch.var(W_modulated, dim=0, correction=1).sum()
-            loss = -torch.sum(W_modulated * energies.view(-1, 1)) + 0.1 * var_term
-            loss.backward()
-            with torch.no_grad():
-                grads = W_curr.grad.abs().sum(dim=0)
-                weights = W_curr.abs().sum(dim=0)
-                importance = 0.6 * weights + 0.4 * grads
-                importance = importance / (importance.max() + 1e-12)
-                n_keep = int(kept_mask.sum().item() * (1.0 - self.rfe_removal_rate))
-                if n_keep < 10: break
-                active = torch.where(kept_mask)[0]
-                local_imp = importance[active]
-                _, top = torch.topk(local_imp, k=min(n_keep, local_imp.numel()))
-                new_mask = torch.zeros_like(kept_mask)
-                new_mask[active[top]] = True
-                kept_mask = new_mask
-                W_curr.grad.zero_()
-
-        with torch.no_grad():
-            final_idx = torch.where(kept_mask)[0]
-            W_final = W[:, final_idx]
-            vocab_final = [vocab100[i] for i in final_idx.tolist()]
-        return W_final, vocab_final
-
     def build_state(self, text: str, progress=None) -> ModelState:
-        if progress: progress(0, desc="Initializing Activator")
-        
-        # 1. Initialize and Bootstrap Neuronal Activator
-        activator = NeuronalActivator()
+        # Prepare tokens early (needed for activator bootstrap + flow field)
         tokens = basic_tokenize(text)
-        activator.bootstrap(tokens, epochs=50, progress=progress)
-        
-        if progress: progress(0.3, desc="TF-IDF Analysis")
-        clean_text = text.replace("[PROBLEM]", "").replace("[SOLUTION]", "")
-        docs = re.split(r"\n\s*\n", clean_text)
+        flow_by_token = compute_problem_flow_by_token(tokens)
+
+        # LM
+        lm = QuadgramLM(add_k=self.lm_add_k)
+        lm.ingest(tokens)
+
+        # Token boost table (same spirit as V4: important tokens get higher boosts)
+        token_boost: Dict[str, float] = {}
+        for tok, boost_val in COGNITIVE_TOKENS.items():
+            token_boost[tok] = boost_val
+
+        # Activator + bootstrap to mimic SymbolicPair
+        activator = NeuronalActivator()
+        if torch.cuda.is_available():
+            activator = activator.cuda()
+        if progress:
+            progress(0.02, desc="Bootstrapping activator")
+        activator.bootstrap_on_tokens(tokens, epochs=self.activator_boot_epochs, progress=progress)
+
+        # Graph aesthetic flow (computed using activator)
+        G = SimpleGraph.from_token_sequence(tokens, activator, max_nodes=220, x_pos_default=0.5)
+
+        # Minimal "nodelets" retained (TF-IDF+SVD like V4), but we keep it lightweight here
+        clean_text = text.replace("[PROBLEM]", "").replace("[SOLUTION]", "").replace("[PAIR-BEGIN]", "").replace("[PAIR-END]", "")
+        docs = re.split(r"\n\s*\n", clean_text)[:500]
         X, vocab = pure_tfidf(docs, max_features=8000)
 
-        if X.size == 0 or len(vocab) == 0:
-            vocab100 = ["the", "is", "a"]
-            probs = torch.tensor([0.34, 0.33, 0.33], dtype=torch.float32)
-            return ModelState([], vocab100, torch.zeros(0, 3), probs, {}, 
-                            torch.zeros_like(probs), torch.zeros_like(probs), 
-                            SimpleGraph([], [], {}, {}), None, activator)
+        nodelets: List[Nodelet] = []
+        vocab100: List[str] = []
+        W = torch.zeros(0, 0)
+        probs = torch.ones(1)
 
-        top_idx = np.argsort(-X.sum(axis=0))[: self.bars_n]
-        vocab100 = [vocab[i] for i in top_idx]
-        X_svd = X[:, top_idx]
+        if X.size != 0 and len(vocab) != 0:
+            top_idx = np.argsort(-X.sum(axis=0))[: self.bars_n]
+            vocab100 = [vocab[i] for i in top_idx]
+            X_svd = X[:, top_idx]
+            n_rows, n_cols = X_svd.shape
+            max_rank = min(n_rows, n_cols)
+            k = 1 if max_rank <= 1 else min(self.nodelets_n, max_rank, 10)
 
-        svd = pure_truncated_svd(X_svd, n_components=min(self.nodelets_n, min(X_svd.shape), 10))
-        nodelets = []
-        for i, comp in enumerate(svd.components_):
-            terms = sorted([(vocab100[j], float(comp[j])) for j in range(len(comp))], key=lambda x: -abs(x[1]))
-            eng = float(np.linalg.norm(comp))
-            nodelets.append(Nodelet(i, terms, eng, f"Nodelet {i}"))
+            svd = pure_truncated_svd(X_svd, n_components=k, random_state=self.svd_random_state)
+            for i, comp in enumerate(svd.components_):
+                terms = sorted([(vocab100[j], float(comp[j])) for j in range(len(comp))],
+                               key=lambda x: -abs(x[1]))[:10]
+                eng = float(np.linalg.norm(comp))
+                nodelets.append(Nodelet(i, terms, eng, f"Nodelet {i}"))
 
-        W = torch.tensor(svd.components_, dtype=torch.float32)
-        W = F.relu(W)
-        if W.numel() > 0: W = W / (W.max(dim=1, keepdim=True)[0] + 1e-12)
+            W = torch.tensor(svd.components_, dtype=torch.float32)
+            W = F.relu(W)
+            if W.numel() > 0:
+                W = W / (W.max(dim=1, keepdim=True)[0] + 1e-12)
+                energies = torch.tensor([n.energy for n in nodelets], dtype=torch.float32)
+                energies = energies / (energies.max() + 1e-12)
+                logits = (energies.view(-1, 1) * W).sum(dim=0)
+                probs = F.softmax(logits / max(self.softmax_temp, 1e-6), dim=-1)
+                probs = self.focus_layer(probs.view(1, 1, -1)).squeeze(0).squeeze(0)
 
-        energies = torch.tensor([n.energy for n in nodelets], dtype=torch.float32) if nodelets else torch.ones(1)
-        energies = energies / (energies.max() + 1e-12)
+            # inject boosts based on probs (V4 style)
+            for w, p in zip(vocab100, probs.detach().cpu().tolist()):
+                for subw in w.split():
+                    if len(subw) > 2 and subw not in STOP_WORDS:
+                        token_boost[subw] = max(token_boost.get(subw, 0.0), math.log(p + 1e-12) + 5.0)
 
-        if W.numel() > 0:
-            W, vocab100 = self._synaptic_prune(W, energies, vocab100, progress)
-            logits = (energies.view(-1, 1) * W).sum(dim=0)
-            probs = F.softmax(logits / max(self.softmax_temp, 1e-6), dim=-1)
-            probs = self.focus_layer(probs.view(1, 1, -1)).squeeze(0).squeeze(0)
-        else:
-            probs = torch.ones(len(vocab100)) / max(1, len(vocab100))
+        return ModelState(
+            nodelets=nodelets,
+            vocab100=vocab100,
+            binding_W=W,
+            bar_probs=probs,
+            token_boost=token_boost,
+            semantic_graph=G,
+            lm=lm,
+            activator=activator,
+            problem_flow_by_token=flow_by_token,
+        )
 
-        token_boost = {}
-        for w, p in zip(vocab100, probs.detach().cpu().tolist()):
-            for subw in w.split():
-                if len(subw) > 2 and subw not in STOP_WORDS:
-                    token_boost[subw] = max(token_boost.get(subw, 0.0), math.log(p + 1e-12) + 5.0)
-
-        return ModelState(nodelets, vocab100, W, probs, token_boost, 
-                         torch.zeros_like(probs), torch.zeros_like(probs), 
-                         SimpleGraph([], [], {}, {}), None, activator)
-
-    def prepare_corpus(self, text: str, progress=None) -> PreparedCorpus:
-        text = inject_cognitive_tokens(text)
+    def prepare_corpus(self, raw_text: str, progress=None) -> PreparedCorpus:
+        text = inject_cognitive_tokens(raw_text)
         text = normalize(text)
-        state = self.build_state(text, progress)
+        state = self.build_state(text, progress=progress)
         tokens = basic_tokenize(text)
-        
-        lm = QuadgramLM(self.lm_add_k, activator=state.activator)
-        lm.ingest(tokens)
-        
-        for tok, boost_val in COGNITIVE_TOKENS.items():
-            state.token_boost[tok] = boost_val
-            
-        G = SimpleGraph.from_token_sequence(tokens, state.activator)
-        state.semantic_graph = G
-        ref_sig = graph_signature(G)
-        return PreparedCorpus(text, tokens, lm, state, ref_sig)
+        return PreparedCorpus(text=text, tokens=tokens, state=state)
 
-    def _final_probs_for_context_cached(self, prep: PreparedCorpus, w1: str, w2: str, w3: str) -> Tuple[List[str], torch.Tensor, float]:
-        key = (int(self.cache_version), str(w1), str(w2), str(w3))
-        cached = self.radix_cache.get(key)
-        if cached: return cached
+    def _final_probs(self, prep: PreparedCorpus, w1: str, w2: str, w3: str,
+                     x_pos: torch.Tensor, allow_cache: bool = True) -> Tuple[List[str], torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+          cand: list[str]
+          final_probs: [B]
+          flow_vec: [B]  (candidate flow score in [0,1])
+        """
+        # Cache only when x_pos is a plain float tensor w/o grad
+        cache_ok = allow_cache and (not x_pos.requires_grad) and (x_pos.numel() == 1)
 
-        cand, base_probs, pair_weights = prep.lm.next_distribution(w1, w2, w3)
-        if not cand:
-            cand = prep.lm.vocab if prep.lm.vocab else ["the", "is", "a"]
-            base_p = torch.ones(len(cand)) / max(1, len(cand))
-            pair_weights = [1.0] * len(cand)
-        else:
-            base_p = base_probs.detach().clone().float()
-            if base_p.numel() != len(cand): base_p = torch.ones(len(cand)) / max(1, len(cand))
+        key = None
+        if cache_ok:
+            key = (self.cache_version, w1, w2, w3, float(x_pos.item()))
+            cached = self.cache.get(key)
+            if cached is not None:
+                return cached
 
-        base_p = base_p.view(-1) / (base_p.sum() + 1e-12)
+        cand, base_probs = prep.state.lm.next_distribution(w1, w2, w3)
+        base_p = base_probs.to(dtype=torch.float32)
+        base_p = base_p / (base_p.sum() + 1e-12)
         base_p = self.focus_layer(base_p.view(1, 1, -1)).squeeze(0).squeeze(0)
 
+        # entropy / peak
         val = base_p.clamp_min(1e-12)
         H = -torch.sum(base_p * torch.log(val))
-        entropy01 = (H / max(1e-9, math.log(max(2.0, float(base_p.numel()))))).clamp(0.0, 1.0)
+        V = float(base_p.numel())
+        entropy01 = (H / max(1e-9, math.log(max(2.0, V)))).clamp(0.0, 1.0)
         peak01 = base_p.max().clamp(0.0, 1.0)
-        
-        boosts = torch.tensor([prep.state.token_boost.get(w, 0.0) for w in cand]).view(-1)
-        
-        # Inject Neural Firing Rates
-        pair_tensor = torch.tensor(pair_weights, dtype=torch.float32).view(-1)
-        # Normalize firing rates around 1.0
-        pair_tensor = pair_tensor / (pair_tensor.mean() + 1e-12)
-        boosts = boosts + self.pairwise_strength * pair_tensor
-        
+
+        device = prep.state.activator.emb.weight.device
+        x_pos = x_pos.to(device=device, dtype=torch.float32).clamp(0.0, 1.0)
+
+        boosts = torch.tensor([prep.state.token_boost.get(w, 0.0) for w in cand],
+                              dtype=torch.float32, device=device)
+
+        # differentiable pairwise weights from activator
+        w_pair, _vec4 = prep.state.activator.forward_weight(w3, cand, x_pos=x_pos)
+        w_pair = w_pair / (w_pair.mean() + 1e-12)
+        boosts = boosts + self.pairwise_strength * w_pair
+
+        # V4-style "gravity" + continuous problem flow
         context_str = f"{w1} {w2} {w3}"
-        gravity = 0.3 if "[SOLUTION]" in context_str else (0.2 if "[PROBLEM]" in context_str else 0.0)
-        boost01 = torch.tanh((boosts.abs().mean() + gravity) / 3.0).clamp(0.0, 1.0)
+        gravity = 0.0
+        if "[PROBLEM]" in context_str:
+            gravity = 0.2
+        if "[SOLUTION]" in context_str:
+            gravity = 0.3
+
+        flow_w3 = float(prep.state.problem_flow_by_token.get(w3, 0.0))
+        flow_w3_t = torch.tensor(flow_w3, dtype=torch.float32, device=device)
+
+        boost01 = torch.tanh((boosts.abs().mean() + gravity + flow_w3_t) / 3.0).clamp(0.0, 1.0)
+
+        # graph flow + x_pos coupling (keeps "aesthetic_flow" as a factor)
+        base_flow = float(prep.state.semantic_graph.get_aesthetic_flow())
+        base_flow_t = torch.tensor(base_flow, dtype=torch.float32, device=device).clamp(0.0, 1.0)
+        aesthetic_flow01 = (base_flow_t * (0.5 + 0.5 * x_pos)).clamp(0.0, 1.0)
+
+        g = self.fuzzy_ctl(entropy01, peak01, boost01, aesthetic_flow01, osculator_strength=self.osculator_strength)
+
+        effective_steer = self.base_steer * g
+        effective_temp = self.base_temp * (1.2 - 0.7 * g)
+
+        potentials = torch.log(base_p.to(device=device).clamp_min(1e-12)) + effective_steer * boosts
+        potentials = potentials / torch.clamp(effective_temp, min=1e-6)
+        final_probs = F.softmax(potentials, dim=-1)
+
+        # flow score per candidate token (used for pos->grad)
+        flow_vec = torch.tensor([prep.state.problem_flow_by_token.get(w, 0.0) for w in cand],
+                                dtype=torch.float32, device=device).clamp(0.0, 1.0)
+
+        out = (cand, final_probs, flow_vec)
+        if cache_ok and key is not None:
+            # cache detached copies only (inference speed)
+            self.cache.put(key, (cand, final_probs.detach(), flow_vec.detach()))
+        return out
+
+    def pos_to_grad_curve(self, prep: PreparedCorpus, context_prompt: str,
+                          n_points: int = 101) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        x-axis: dataset position x in [0,1]
+        y-axis: |d/dx  E_flow| where E_flow = sum_i p_i(x) * flow(cand_i)
+        """
+        seed_toks = basic_tokenize(context_prompt)
+        w1, w2, w3 = self._pick_initial_context(prep.state.lm, seed_toks)
+
+        xs = np.linspace(0.0, 1.0, int(n_points), dtype=np.float32)
+        ys = np.zeros_like(xs)
+
+        for i, xv in enumerate(xs):
+            x = torch.tensor(float(xv), dtype=torch.float32, requires_grad=True)
+            cand, p, flow_vec = self._final_probs(prep, w1, w2, w3, x_pos=x, allow_cache=False)
+            e_flow = torch.sum(p * flow_vec)  # scalar
+            dx = torch.autograd.grad(e_flow, x, retain_graph=False, create_graph=False)[0]
+            ys[i] = float(dx.abs().detach().cpu().item())
+
+        return xs, ys
+
+    @torch.no_grad()
+    def generate(self, prep: PreparedCorpus, prompt: str, start_x: float,
+                 max_tokens: int = 220, seed: int = 42) -> str:
+        rng = np.random.default_rng(int(seed))
+        seed_toks = basic_tokenize(prompt)
+        w1, w2, w3 = self._pick_initial_context(prep.state.lm, seed_toks)
+
+        out_tokens: List[str] = []
+        device = prep.state.activator.emb.weight.device
+
+        alpha_count = 0
+        total_steps = int(max_tokens)
         
-        aesthetic_flow = prep.state.semantic_graph.get_aesthetic_flow()
-        g = self.fuzzy_ctl(entropy01, peak01, boost01, aesthetic_flow, osculator_strength=self.osculator_strength)
+        for i in range(total_steps):
+            # Advance X linearly from start_x to 1.0 based on progress
+            progress = i / max(1, total_steps)
+            curr_x_val = start_x + (1.0 - start_x) * progress
+            x = torch.tensor(float(curr_x_val), dtype=torch.float32, device=device)
 
-        eff_steer = self.base_steer * float(g.item())
-        eff_temp = self.base_temp * (1.2 - 0.7 * float(g.item()))
-        potentials = torch.log(base_p.clamp_min(1e-12)) + eff_steer * boosts
-        final_probs = F.softmax(potentials / max(eff_temp, 1e-6), dim=-1)
+            cand, probs, _flow_vec = self._final_probs(prep, w1, w2, w3, x_pos=x, allow_cache=True)
+            p = probs.detach().cpu().numpy()
+            p = p / (p.sum() + 1e-12)
+            idx = rng.choice(len(cand), p=p)
+            tok = cand[idx]
+            out_tokens.append(tok)
 
-        result = (cand, final_probs.detach(), float(g.item()))
-        self.radix_cache.put(key, result)
-        return result
+            w1, w2, w3 = w2, w3, tok
+            if re.match(r"[A-Za-z]", tok):
+                alpha_count += 1
+            if tok in {".", "!", "?"} and alpha_count >= 40:
+                # Stop if we are late in the sequence and hit punctuation
+                if i > total_steps * 0.75:
+                    break
 
-# ----------------------------
-# Decoder and Execution
-# ----------------------------
+        return detokenize(out_tokens)
 
-@dataclass
-class DecodeStream:
-    stream_id: int; tokens_out: List[str]; w1: str; w2: str; w3: str
-    done: bool = False; alpha_count: int = 0; max_steps: int = 1000
-    stop_tokens: set = field(default_factory=lambda: {".", "!", "?"})
-    min_alpha: int = 200
-
-class ContinuousBatchDecoder:
-    def __init__(self, gen, prep, rng, token_budget_per_round=64):
-        self.gen, self.prep, self.rng = gen, prep, rng
-        self.token_budget_per_round = int(max(1, token_budget_per_round))
-
-    def _sample_fuzzy(self, cand, probs, g):
-        p = probs.detach().cpu().numpy()
-        p = p / (p.sum() + 1e-12)
-        idx = self.rng.choice(len(cand), p=p)
-        return cand[idx]
-
-    def decode_step(self, streams: List[DecodeStream]) -> List[DecodeStream]:
-        active = [s for s in streams if not s.done]
-        if not active: return streams
-        steps_taken = 0
-        while steps_taken < self.token_budget_per_round and active:
-            s = active[steps_taken % len(active)]
-            cand, probs, g = self.gen._final_probs_for_context_cached(self.prep, s.w1, s.w2, s.w3)
-            next_token = self._sample_fuzzy(cand, probs, g)
-            s.tokens_out.append(next_token)
-            s.w1, s.w2, s.w3 = s.w2, s.w3, next_token
-            if re.match(r"[a-zA-Z]", next_token): s.alpha_count += 1
-            if len(s.tokens_out) >= s.max_steps: s.done = True
-            steps_taken += 1
-            active = [s for s in streams if not s.done]
-        return streams
 
 # ----------------------------
-# UI & Main
+# GRADIO UI
 # ----------------------------
 
-@dataclass
-class SGPrompt: text: str
-@dataclass
-class SGContext:
-    text: str; gen: NeuroSymbolicGraphGenerator; seed: int
-    prepared: Optional[PreparedCorpus] = None
-    def ensure_prepared(self):
-        if not self.prepared:
-            torch.manual_seed(self.seed); np.random.seed(self.seed)
-            self.prepared = self.gen.prepare_corpus(self.text)
-
-def sg_fork(ctx: SGContext, prompt: SGPrompt, n: int = 3) -> List[Tuple[SGContext, str]]:
-    ctx.ensure_prepared()
-    return [(ctx, prompt.text) for _ in range(n)]
-
-def sg_gen_batched(contexts: List[SGContext], prompts: List[str], max_tokens: int = 200, stop_at_punc: bool = True) -> List[str]:
-    if not contexts: return []
-    gen = contexts[0].gen
-    rng = np.random.default_rng(contexts[0].seed)
-    streams = []
-    for i, (ctx, p_txt) in enumerate(zip(contexts, prompts)):
-        ctx.ensure_prepared()
-        seed_toks = basic_tokenize(p_txt)
-        w1, w2, w3 = gen._pick_initial_context(ctx.prepared.lm, seed_toks)
-        streams.append(DecodeStream(i, [], w1, w2, w3, max_steps=max_tokens, min_alpha=10 if stop_at_punc else 9999))
-    
-    decoder = ContinuousBatchDecoder(gen, contexts[0].prepared, rng)
-    while any(not s.done for s in streams):
-        streams = decoder.decode_step(streams)
-    return [detokenize(s.tokens_out) for s in streams]
-
-def sg_join(prompts: List[str], joiner: str = "\n") -> SGPrompt: return SGPrompt(joiner.join(prompts))
-
-def run_program(infile, use_hf, hf_dataset, hf_split, hf_max_rows, n_take, seed, steer, focus, takeaway_prompt, summary_prompt, pairwise_strength, osculator_strength, progress=gr.Progress()):
+def _load_corpus(use_hf: bool, hf_dataset: str, hf_split: str, hf_max_rows: int, infile) -> str:
     if use_hf:
-        try:
-            ds = load_dataset(hf_dataset, split=hf_split)
-            rows = int(hf_max_rows) if hf_max_rows > 0 else len(ds)
-            corpus_text = "\n".join(str(x) for x in ds.select(range(min(rows, len(ds))))["text"])
-        except Exception as e: return f"Dataset Error: {e}"
+        ds = load_dataset(hf_dataset, split=hf_split)
+        rows = int(hf_max_rows) if int(hf_max_rows) > 0 else len(ds)
+        rows = min(rows, len(ds))
+        if "text" in ds.column_names:
+            return "\n".join(str(x) for x in ds.select(range(rows))["text"])
+        return "\n".join(str(ds[i]) for i in range(rows))
     else:
-        try: corpus_text = load_text(_resolve_gradio_file_to_path(infile))
-        except Exception as e: return f"File Error: {e}"
+        return load_text(_resolve_gradio_file_to_path(infile))
+
+def run_generate(infile, use_hf, hf_dataset, hf_split, hf_max_rows,
+                 prompt, seed, x_start, max_tokens,
+                 steer, focus, pairwise, oscs, boot_epochs,
+                 progress=gr.Progress()):
+    try:
+        corpus_text = _load_corpus(bool(use_hf), str(hf_dataset), str(hf_split), int(hf_max_rows), infile)
+    except Exception as e:
+        return f"Corpus load error: {e}"
 
     gen = NeuroSymbolicGraphGenerator(
-        nodelets_n=10, bars_n=100, svd_random_state=int(seed),
-        steer_strength=float(steer), focus_strength=float(focus),
-        pairwise_strength=float(pairwise_strength), osculator_strength=float(osculator_strength)
+        steer_strength=float(steer),
+        focus_strength=float(focus),
+        pairwise_strength=float(pairwise),
+        osculator_strength=float(oscs),
+        activator_boot_epochs=int(boot_epochs),
     )
-    ctx = SGContext(corpus_text, gen, seed=int(seed))
-    ctx.ensure_prepared()
+    prep = gen.prepare_corpus(corpus_text, progress=progress)
 
-    # Display Neuronal Activator stats
-    act = ctx.prepared.state.activator
     header = (
-        f"[NEURONAL ACTIVATOR STATUS]\n"
-        f"Bootstrapped on corpus structure.\n"
-        f"Global Aesthetic Mean (Learned): {act.global_mean.detach().cpu().numpy()}\n"
-        f"Aesthetic Flow: {ctx.prepared.state.semantic_graph.get_aesthetic_flow():.3f}\n"
+        f"[STATE]\n"
+        f"Tokens: {len(prep.tokens)}\n"
+        f"Aesthetic flow (graph): {prep.state.semantic_graph.get_aesthetic_flow():.3f}\n"
+        f"Activator global_mean4: {prep.state.activator.global_mean4.detach().cpu().numpy()}\n"
         f"{'-'*40}\n\n"
     )
+    txt = gen.generate(prep, prompt=str(prompt), start_x=float(x_start), max_tokens=int(max_tokens), seed=int(seed))
+    return header + txt
 
-    root = SGPrompt(str(takeaway_prompt).strip() + "\n\n")
-    branches = sg_fork(ctx, root, n=int(n_take))
-    branch_ctxs, branch_prompts = zip(*branches)
-    
-    take_texts = sg_gen_batched(list(branch_ctxs), [p + f"[Takeaway {i+1}] " for i, p in enumerate(branch_prompts)], max_tokens=620)
-    merged = sg_join([p + t for p, t in zip(branch_prompts, take_texts)], joiner="\n\n")
-    final_prompt = SGPrompt(summary_prompt.replace("{joined_takeaways}", merged.text))
-    final_text = sg_gen_batched([ctx], [final_prompt.text], max_tokens=460)[0]
+def run_pos_grad(infile, use_hf, hf_dataset, hf_split, hf_max_rows,
+                 context_prompt, n_points,
+                 steer, focus, pairwise, oscs, boot_epochs,
+                 progress=gr.Progress()):
+    try:
+        corpus_text = _load_corpus(bool(use_hf), str(hf_dataset), str(hf_split), int(hf_max_rows), infile)
+    except Exception as e:
+        return f"Corpus load error: {e}"
 
-    return header + final_prompt.text + " " + final_text
+    gen = NeuroSymbolicGraphGenerator(
+        steer_strength=float(steer),
+        focus_strength=float(focus),
+        pairwise_strength=float(pairwise),
+        osculator_strength=float(oscs),
+        activator_boot_epochs=int(boot_epochs),
+    )
+    prep = gen.prepare_corpus(corpus_text, progress=progress)
+
+    xs, ys = gen.pos_to_grad_curve(prep, context_prompt=str(context_prompt), n_points=int(n_points))
+
+    lines = ["x_pos\t|dE_flow/dx|"]
+    for x, y in zip(xs.tolist(), ys.tolist()):
+        lines.append(f"{x:.4f}\t{y:.6f}")
+    return "\n".join(lines)
 
 def build_app():
-    with gr.Blocks(title="Neurosymbolic V5.0 - Neuronal Activator") as demo:
+    with gr.Blocks(title="NeuroSymbolic V6.1") as demo:
         gr.Markdown(
-            "# Neurosymbolic V5.0: Neuronal Activator Bootstrapping\n"
-            "**Core Philosophy:** Replaces static symbolic rules with a trainable 'Neuronal Activator' that "
-            "learns to fire based on aesthetic properties (Harmony, Density, Momentum) by bootstrapping itself on the corpus.\n\n"
-            "**PyTorch Bootstrapping:** The network pre-trains on bigrams to internalize symbolic rules before generation begins."
+            "# NeuroSymbolic V6.1: Dynamic Flow Control\n"
+            "**Max Tokens Slider**: Sets the sequence length. As generation proceeds up to this limit, "
+            "the dataset position \(x\) advances linearly from your Start Position toward 1.0.\n\n"
+            "This allows the Neuronal Activator to shift its aesthetic preferences (e.g., from 'Problem' to 'Solution' flow) "
+            "dynamically during the sentence."
         )
+
         with gr.Row():
             with gr.Column(scale=1):
                 use_hf = gr.Checkbox(label="Use Hugging Face dataset", value=True)
-                hf_dataset = gr.Textbox(label="HF dataset", value="AiresPucrs/stanford-encyclopedia-philosophy")
-                hf_split = gr.Textbox(label="Split", value="train")
-                hf_max_rows = gr.Slider(0, 20000, value=2000, label="Max rows")
-                infile = gr.File(label="Input File (txt/md)")
+                hf_dataset = gr.Textbox(label="HF dataset name", value="AiresPucrs/stanford-encyclopedia-philosophy")
+                hf_split = gr.Textbox(label="HF split", value="train")
+                hf_max_rows = gr.Slider(0, 20000, value=2000, step=100, label="HF max rows (0=all)")
+                infile = gr.File(label="Input File (txt/md) if not using HF", file_types=[".txt", ".md"])
+
+                steer = gr.Slider(0, 5, value=1.35, step=0.05, label="Base steer")
+                focus = gr.Slider(0, 1, value=0.5, step=0.01, label="Focus strength")
+                pairwise = gr.Slider(0, 2, value=0.4, step=0.05, label="Pairwise strength")
+                oscs = gr.Slider(0, 1, value=0.1, step=0.05, label="Osculator strength")
+                boot_epochs = gr.Slider(0, 80, value=25, step=5, label="Activator bootstrap epochs")
+
             with gr.Column(scale=2):
-                out_txt = gr.Textbox(label="Output", lines=24)
-        with gr.Row():
-            n_take = gr.Slider(1, 10, value=5, label="Batches")
-            seed = gr.Number(value=42, label="Seed")
-            steer = gr.Slider(0, 5, value=1.35, label="Steer")
-            focus = gr.Slider(0, 1, value=0.5, label="Focus")
-            pairwise = gr.Slider(0, 2, value=0.4, label="Neuronal Strength")
-            oscs = gr.Slider(0, 1, value=0.1, label="Osculator Strength")
-        
-        btn = gr.Button("Run Neuronal Generator", variant="primary")
-        btn.click(run_program, inputs=[infile, use_hf, hf_dataset, hf_split, hf_max_rows, n_take, seed, steer, focus, gr.Textbox(label="Prefix"), gr.Textbox(label="Summary Prompt", value="explain this?"), pairwise, oscs], outputs=out_txt)
-    return demo
+                tabs = gr.Tabs()
+
+                with gr.TabItem("Generate"):
+                    prompt = gr.Textbox(label="Prompt", value="explain this?", lines=3)
+                    seed = gr.Number(value=42, label="Seed")
+                    
+                    # NEW SLIDER REQUESTED
+                    max_tokens = gr.Slider(10, 1000, value=250, step=10, label="Max Tokens Slider")
+                    
+                    x_start = gr.Slider(0, 1, value=0.0, step=0.01, label="Start Position (x)")
+                    
+                    out_txt = gr.Textbox(label="Output", lines=22)
+                    btn = gr.Button("Run generator", variant="primary")
+                    btn.click(
+                        run_generate,
+                        inputs=[infile, use_hf, hf_dataset, hf_split, hf_max_rows,
+                                prompt, seed, x_start, max_tokens,
+                                steer, focus, pairwise, oscs, boot_epochs],
+                        outputs=out_txt
+                    )
+
+                with gr.TabItem("x→|∇| curve"):
+                    context_prompt = gr.Textbox(
+                        label="Context prompt (defines w1 w2 w3)",
+                        value="[PROBLEM] why is this hard ? [SOLUTION] because",
+                        lines=2,
+                    )
+                    n_points = gr.Slider(11, 401, value=101, step=10, label="Number of x samples")
+                    out_curve = gr.Textbox(label="Curve (tab-separated)", lines=22)
+                    btn2 = gr.Button("Compute pos→grad curve", variant="primary")
+                    btn2.click(
+                        run_pos_grad,
+                        inputs=[infile, use_hf, hf_dataset, hf_split, hf_max_rows,
+                                context_prompt, n_points,
+                                steer, focus, pairwise, oscs, boot_epochs],
+                        outputs=out_curve
+                    )
+
+        return demo
 
 if __name__ == "__main__":
     build_app().queue().launch()

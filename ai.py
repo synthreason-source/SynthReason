@@ -2,11 +2,21 @@
 # -*- coding: utf-8 -*-
 
 """
-NeuroSymbolic V6.1 - Conversational Format
+NeuroSymbolic V6.1 - Multi-Entity Problem Solving
 - Max Tokens Slider: Controls sequence length and x-axis advancement.
 - Neuronal Activator: Differentiable aesthetic weight generator.
 - Problem Flow Gradients: Positional scalars [0,1] modulate firing rates.
-- NEW: Conversational entities - each segment represents a different speaker
+- NEW: Multi-entity problem solving with specialized roles
+
+PROBLEM-SOLVING ROLES:
+- Problem Poser (flow: 0.0-0.25): Frames questions and identifies challenges
+- Analyzer (flow: 0.2-0.45): Examines details and breaks down components  
+- Solution Proposer (flow: 0.4-0.7): Suggests approaches and methods
+- Critic (flow: 0.5-0.75): Identifies issues and challenges proposals
+- Synthesizer (flow: 0.7-1.0): Integrates insights and draws conclusions
+
+Each role operates at different positions in the problem→solution flow space,
+creating natural progression through collaborative problem-solving.
 
 ADDED (V6.1+): Hemicontinuity regularizer for discrete correspondences
 - Treats x_pos -> Gamma(x_pos) as a set-valued mapping where Gamma returns TopK candidates.
@@ -1058,13 +1068,14 @@ class NeuroSymbolicGraphGenerator:
     @torch.no_grad()
     def generate(self, prep: PreparedCorpus, prompt: str, start_x: float,
                  max_tokens: int = 220, seed: int = 42, num_speakers: int = 2,
-                 tokens_per_turn: int = 50) -> str:
+                 tokens_per_turn: int = 50, problem_solving_mode: bool = True) -> str:
         """
-        Generate conversational dialogue with multiple speakers taking turns.
+        Generate multi-entity problem-solving dialogue.
         
         Args:
             num_speakers: Number of conversational entities (default 2)
             tokens_per_turn: Approximate tokens per speaker turn (default 50)
+            problem_solving_mode: Use specialized problem-solving roles (default True)
         """
         rng = np.random.default_rng(int(seed))
         seed_toks = basic_tokenize(prompt)
@@ -1073,24 +1084,65 @@ class NeuroSymbolicGraphGenerator:
         device = prep.state.activator.emb.weight.device
         total_steps = int(max_tokens)
         
-        # Speaker labels
-        speaker_labels = [f"Speaker {chr(65 + i)}" for i in range(int(num_speakers))]
+        # Define problem-solving roles with cognitive biases
+        if problem_solving_mode:
+            role_definitions = [
+                ("Problem Poser", 0.0, 0.25, "questioning", ["?", "what", "how", "why"]),
+                ("Analyzer", 0.2, 0.45, "analyzing", ["because", "consider", "examine", "observe"]),
+                ("Solution Proposer", 0.4, 0.7, "proposing", ["solution", "approach", "method", "could"]),
+                ("Critic", 0.5, 0.75, "critiquing", ["however", "but", "issue", "problem"]),
+                ("Synthesizer", 0.7, 1.0, "synthesizing", ["therefore", "thus", "overall", "combining"]),
+            ]
+            
+            # Cycle through roles based on num_speakers
+            speaker_roles = []
+            for i in range(int(num_speakers)):
+                role_idx = i % len(role_definitions)
+                speaker_roles.append(role_definitions[role_idx])
+        else:
+            # Generic speakers
+            speaker_roles = [(f"Speaker {chr(65 + i)}", 0.0, 1.0, "speaking", []) 
+                            for i in range(int(num_speakers))]
         
-        # Track conversation structure
-        conversation: List[Tuple[str, List[str]]] = []  # [(speaker, tokens)]
+        # Track conversation structure with role metadata
+        conversation: List[Tuple[str, str, List[str], float]] = []  # [(role, mode, tokens, x_bias)]
         current_speaker_idx = 0
         current_turn_tokens: List[str] = []
         alpha_count_turn = 0
         
-        global_token_count = 0
+        # Inject cognitive tokens based on role
+        role_token_cache: Dict[str, List[str]] = {}
 
         for i in range(total_steps):
-            # Advance X linearly from start_x to 1.0 based on progress
+            # Get current role
+            role_name, x_min, x_max, mode, keywords = speaker_roles[current_speaker_idx]
+            
+            # Role-based x position bias (blend global progress with role preference)
             progress = i / max(1, total_steps)
-            curr_x_val = start_x + (1.0 - start_x) * progress
+            global_x = start_x + (1.0 - start_x) * progress
+            role_x_bias = (x_min + x_max) / 2.0
+            
+            # Blend: 70% global progression, 30% role bias
+            curr_x_val = 0.7 * global_x + 0.3 * role_x_bias
+            curr_x_val = max(x_min, min(x_max, curr_x_val))  # Clamp to role range
+            
             x = torch.tensor(float(curr_x_val), dtype=torch.float32, device=device)
 
-            cand, probs, _flow_vec = self._final_probs(prep, w1, w2, w3, x_pos=x, allow_cache=True)
+            cand, probs, flow_vec = self._final_probs(prep, w1, w2, w3, x_pos=x, allow_cache=True)
+            
+            # Role-based probability modulation
+            if keywords and problem_solving_mode:
+                keyword_boost = torch.zeros_like(probs)
+                for idx, c in enumerate(cand):
+                    if c.lower() in keywords:
+                        keyword_boost[idx] = 0.3
+                    # Boost tokens with flow matching role preference
+                    flow_match = 1.0 - abs(flow_vec[idx].item() - role_x_bias)
+                    keyword_boost[idx] += 0.2 * flow_match
+                
+                probs = probs * torch.exp(keyword_boost)
+                probs = probs / (probs.sum() + 1e-12)
+            
             p = probs.detach().cpu().numpy()
             p = p / (p.sum() + 1e-12)
             idx = rng.choice(len(cand), p=p)
@@ -1100,8 +1152,6 @@ class NeuroSymbolicGraphGenerator:
             w1, w2, w3 = w2, w3, tok
             if re.match(r"[A-Za-z]", tok):
                 alpha_count_turn += 1
-            
-            global_token_count += 1
             
             # Check if we should switch speakers
             should_switch = False
@@ -1120,9 +1170,8 @@ class NeuroSymbolicGraphGenerator:
                     should_switch = True
             
             if should_switch and current_turn_tokens:
-                # Save current speaker's turn
-                speaker = speaker_labels[current_speaker_idx]
-                conversation.append((speaker, list(current_turn_tokens)))
+                # Save current speaker's turn with role metadata
+                conversation.append((role_name, mode, list(current_turn_tokens), role_x_bias))
                 
                 # Switch to next speaker
                 current_speaker_idx = (current_speaker_idx + 1) % num_speakers
@@ -1131,20 +1180,42 @@ class NeuroSymbolicGraphGenerator:
         
         # Add any remaining tokens as final turn
         if current_turn_tokens:
-            speaker = speaker_labels[current_speaker_idx]
-            conversation.append((speaker, current_turn_tokens))
+            role_name, x_min, x_max, mode, keywords = speaker_roles[current_speaker_idx]
+            role_x_bias = (x_min + x_max) / 2.0
+            conversation.append((role_name, mode, current_turn_tokens, role_x_bias))
         
-        # Format as conversational dialogue
-        return self._format_conversation(conversation)
+        # Format as problem-solving dialogue
+        return self._format_problem_solving_conversation(conversation, problem_solving_mode)
     
-    def _format_conversation(self, conversation: List[Tuple[str, List[str]]]) -> str:
-        """Format conversation turns into readable dialogue."""
+    def _format_problem_solving_conversation(self, conversation: List[Tuple[str, str, List[str], float]], 
+                                              problem_solving_mode: bool) -> str:
+        """Format conversation turns into problem-solving dialogue with role indicators."""
         lines = []
-        for speaker, tokens in conversation:
+        
+        if problem_solving_mode:
+            lines.append("=" * 60)
+            lines.append("MULTI-ENTITY PROBLEM SOLVING SESSION")
+            lines.append("=" * 60)
+            lines.append("")
+        
+        for role, mode, tokens, x_bias in conversation:
             text = detokenize(tokens)
             if text.strip():
-                lines.append(f"{speaker}: {text}")
-        return "\n\n".join(lines)
+                if problem_solving_mode:
+                    # Add role indicator with mode and flow position
+                    lines.append(f"[{role.upper()}] ({mode}, flow: {x_bias:.2f})")
+                    lines.append(f"{text}")
+                    lines.append("")
+                else:
+                    lines.append(f"{role}: {text}")
+                    lines.append("")
+        
+        if problem_solving_mode:
+            lines.append("=" * 60)
+            lines.append("END OF SESSION")
+            lines.append("=" * 60)
+        
+        return "\n".join(lines)
 
 
 # ----------------------------
@@ -1164,7 +1235,7 @@ def _load_corpus(use_hf: bool, hf_dataset: str, hf_split: str, hf_max_rows: int,
 
 def run_generate(infile, use_hf, hf_dataset, hf_split, hf_max_rows,
                  prompt, seed, x_start, max_tokens, num_speakers, tokens_per_turn,
-                 steer, focus, pairwise, oscs, boot_epochs,
+                 problem_solving_mode, steer, focus, pairwise, oscs, boot_epochs,
                  progress=gr.Progress()):
     try:
         corpus_text = _load_corpus(bool(use_hf), str(hf_dataset), str(hf_split), int(hf_max_rows), infile)
@@ -1186,8 +1257,9 @@ def run_generate(infile, use_hf, hf_dataset, hf_split, hf_max_rows,
     )
     prep = gen.prepare_corpus(corpus_text, progress=progress)
 
+    mode_str = "PROBLEM-SOLVING" if problem_solving_mode else "CONVERSATIONAL"
     header = (
-        f"[CONVERSATIONAL GENERATION]\n"
+        f"[{mode_str} GENERATION]\n"
         f"Tokens: {len(prep.tokens)}\n"
         f"Speakers: {num_speakers}\n"
         f"Tokens per turn: ~{tokens_per_turn}\n"
@@ -1196,28 +1268,34 @@ def run_generate(infile, use_hf, hf_dataset, hf_split, hf_max_rows,
         f"{'-'*60}\n\n"
     )
     txt = gen.generate(prep, prompt=str(prompt), start_x=float(x_start), max_tokens=int(max_tokens), 
-                      seed=int(seed), num_speakers=int(num_speakers), tokens_per_turn=int(tokens_per_turn))
+                      seed=int(seed), num_speakers=int(num_speakers), tokens_per_turn=int(tokens_per_turn),
+                      problem_solving_mode=bool(problem_solving_mode))
     return header + txt
 
 def build_app():
-    with gr.Blocks(title="NeuroSymbolic V6.1 - Conversational") as demo:
+    with gr.Blocks(title="NeuroSymbolic V6.1 - Problem Solving") as demo:
         gr.Markdown(
-            "# NeuroSymbolic V6.1: Conversational Format\n"
-            "**NEW**: Each generated segment represents a different conversational entity (Speaker A, Speaker B, etc.).\n"
-            "The generator creates turn-taking dialogue where speakers exchange ideas based on the corpus.\n\n"
-            "**Max Tokens Slider**: Sets the total sequence length across all speakers.\n"
-            "**Number of Speakers**: How many conversational entities to simulate (2-5).\n"
-            "**Tokens per Turn**: Approximate length of each speaker's turn before switching."
+            "# NeuroSymbolic V6.1: Multi-Entity Problem Solving\n"
+            "**Multi-Entity Problem Solving**: Specialized roles collaborate to analyze and solve problems.\n\n"
+            "**Roles in Problem-Solving Mode:**\n"
+            "- **Problem Poser** (flow: 0.0-0.25): Frames questions and identifies challenges\n"
+            "- **Analyzer** (flow: 0.2-0.45): Examines details and breaks down components\n"
+            "- **Solution Proposer** (flow: 0.4-0.7): Suggests approaches and methods\n"
+            "- **Critic** (flow: 0.5-0.75): Identifies issues and challenges proposals\n"
+            "- **Synthesizer** (flow: 0.7-1.0): Integrates insights and draws conclusions\n\n"
+            "Each role operates at different positions in the problem→solution flow space, creating a natural progression through the problem-solving process."
         )
 
         with gr.Row():
             with gr.Column(scale=1):
+                gr.Markdown("### Corpus Settings")
                 use_hf = gr.Checkbox(label="Use Hugging Face dataset", value=True)
                 hf_dataset = gr.Textbox(label="HF dataset name", value="AiresPucrs/stanford-encyclopedia-philosophy")
                 hf_split = gr.Textbox(label="HF split", value="train")
                 hf_max_rows = gr.Slider(0, 20000, value=2000, step=100, label="HF max rows (0=all)")
                 infile = gr.File(label="Input File (txt/md) if not using HF", file_types=[".txt", ".md"])
 
+                gr.Markdown("### Neural Parameters")
                 steer = gr.Slider(0, 5, value=1.35, step=0.05, label="Base steer")
                 focus = gr.Slider(0, 1, value=0.5, step=0.01, label="Focus strength")
                 pairwise = gr.Slider(0, 2, value=0.4, step=0.05, label="Pairwise strength")
@@ -1227,24 +1305,56 @@ def build_app():
             with gr.Column(scale=2):
                 tabs = gr.Tabs()
 
-                with gr.TabItem("Generate Conversation"):
-                    prompt = gr.Textbox(label="Conversation starter", value="What is knowledge?", lines=3)
-                    seed = gr.Number(value=42, label="Seed")
+                with gr.TabItem("Problem Solving"):
+                    gr.Markdown("### Generation Settings")
+                    
+                    problem_solving_mode = gr.Checkbox(
+                        label="Enable Problem-Solving Mode", 
+                        value=True,
+                        info="Use specialized roles (Problem Poser, Analyzer, etc.) vs generic speakers"
+                    )
+                    
+                    prompt = gr.Textbox(
+                        label="Problem or Question", 
+                        value="What is the nature of consciousness?", 
+                        lines=3,
+                        info="Frame as a question or problem statement for best results"
+                    )
+                    
+                    with gr.Row():
+                        seed = gr.Number(value=42, label="Seed")
+                        x_start = gr.Slider(0, 1, value=0.0, step=0.01, label="Start Position (x)", 
+                                          info="0.0 starts at problem space")
 
-                    max_tokens = gr.Slider(10, 1000, value=300, step=10, label="Max Tokens (total across all speakers)")
-                    num_speakers = gr.Slider(2, 5, value=2, step=1, label="Number of Speakers")
-                    tokens_per_turn = gr.Slider(20, 150, value=50, step=5, label="Tokens per Turn (approx)")
+                    with gr.Row():
+                        max_tokens = gr.Slider(10, 1000, value=400, step=10, 
+                                             label="Max Tokens (total across all roles)")
+                        num_speakers = gr.Slider(2, 5, value=5, step=1, 
+                                               label="Number of Entities",
+                                               info="Cycles through roles if > 5")
+                    
+                    tokens_per_turn = gr.Slider(20, 150, value=60, step=5, 
+                                              label="Tokens per Turn (approx)",
+                                              info="Length of each entity's contribution")
 
-                    x_start = gr.Slider(0, 1, value=0.5, step=0.01, label="Start Position (x)")
-
-                    out_txt = gr.Textbox(label="Conversation Output", lines=22)
-                    btn = gr.Button("Generate Conversation", variant="primary")
+                    out_txt = gr.Textbox(label="Problem-Solving Dialogue", lines=25)
+                    
+                    btn = gr.Button("Generate Problem-Solving Session", variant="primary", size="lg")
                     btn.click(
                         run_generate,
                         inputs=[infile, use_hf, hf_dataset, hf_split, hf_max_rows,
                                 prompt, seed, x_start, max_tokens, num_speakers, tokens_per_turn,
-                                steer, focus, pairwise, oscs, boot_epochs],
+                                problem_solving_mode, steer, focus, pairwise, oscs, boot_epochs],
                         outputs=out_txt
+                    )
+                    
+                    gr.Markdown(
+                        "### Tips for Best Results:\n"
+                        "- Frame prompts as questions or problems\n"
+                        "- Use 5 speakers to get all specialized roles\n"
+                        "- Start at x=0.0 to begin in problem space\n"
+                        "- Increase max tokens (400-600) for deeper analysis\n"
+                        "- Higher pairwise strength (0.6-0.8) encourages role-specific vocabulary"
                     )
 
         return demo

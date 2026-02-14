@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-NeuroSymbolic V6.1 - Dynamic Flow & Token Control
+NeuroSymbolic V6.1 - Conversational Format
 - Max Tokens Slider: Controls sequence length and x-axis advancement.
 - Neuronal Activator: Differentiable aesthetic weight generator.
 - Problem Flow Gradients: Positional scalars [0,1] modulate firing rates.
-- Key Transformations: Retains V4 quadgram logic, fuzzy gating, and cognitive tokens.
+- NEW: Conversational entities - each segment represents a different speaker
 
 ADDED (V6.1+): Hemicontinuity regularizer for discrete correspondences
 - Treats x_pos -> Gamma(x_pos) as a set-valued mapping where Gamma returns TopK candidates.
@@ -692,7 +692,7 @@ class DiscreteHemiContinuity(nn.Module):
         Gamma(x) = TopK(final_probs(x))
     Upper hemicontinuity intuition: small change in x should not suddenly add faraway mass/support.
     Lower hemicontinuity intuition: small change in x should not suddenly lose previously-supported points.
-    These match the open-set based definitions for correspondences at a conceptual level. [web:2]
+    These match the open-set based definitions for correspondences at a conceptual level.
     """
     def __init__(self, top_k: int = 64, mass_eps: float = 1e-4, penalty_strength: float = 0.15, smooth_alpha: float = 0.05):
         super().__init__()
@@ -828,7 +828,7 @@ class RadixLRUCache:
 
 
 # ----------------------------
-# GENERATOR (keeps V4 logic, adds x_pos tensor)
+# GENERATOR (CONVERSATIONAL FORMAT)
 # ----------------------------
 
 class NeuroSymbolicGraphGenerator:
@@ -864,7 +864,7 @@ class NeuroSymbolicGraphGenerator:
         self.cache = RadixLRUCache(max_items=20000)
         self.cache_version = 0
 
-        # Hemicontinuity regularizer (discrete analogue of UHC/LHC for correspondences). [web:2]
+        # Hemicontinuity regularizer (discrete analogue of UHC/LHC for correspondences).
         self.hemi_enable = bool(hemi_enable)
         self.hemi = DiscreteHemiContinuity(
             top_k=int(hemi_top_k),
@@ -1040,7 +1040,7 @@ class NeuroSymbolicGraphGenerator:
         potentials = potentials / torch.clamp(effective_temp, min=1e-6)
         final_probs = F.softmax(potentials, dim=-1)
 
-        # Hemicontinuity stabilization (discrete analogue of UHC/LHC). [web:2]
+        # Hemicontinuity stabilization (discrete analogue of UHC/LHC).
         hemi_pen = torch.tensor(0.0, device=device, dtype=final_probs.dtype)
         if self.hemi_enable:
             final_probs, hemi_pen = self.hemi.apply(cand, final_probs)
@@ -1055,19 +1055,34 @@ class NeuroSymbolicGraphGenerator:
             self.cache.put(key, (cand, final_probs.detach(), flow_vec.detach()))
         return out
 
-
     @torch.no_grad()
     def generate(self, prep: PreparedCorpus, prompt: str, start_x: float,
-                 max_tokens: int = 220, seed: int = 42) -> str:
+                 max_tokens: int = 220, seed: int = 42, num_speakers: int = 2,
+                 tokens_per_turn: int = 50) -> str:
+        """
+        Generate conversational dialogue with multiple speakers taking turns.
+        
+        Args:
+            num_speakers: Number of conversational entities (default 2)
+            tokens_per_turn: Approximate tokens per speaker turn (default 50)
+        """
         rng = np.random.default_rng(int(seed))
         seed_toks = basic_tokenize(prompt)
         w1, w2, w3 = self._pick_initial_context(prep.state.lm, seed_toks)
 
-        out_tokens: List[str] = []
         device = prep.state.activator.emb.weight.device
-
-        alpha_count = 0
         total_steps = int(max_tokens)
+        
+        # Speaker labels
+        speaker_labels = [f"Speaker {chr(65 + i)}" for i in range(int(num_speakers))]
+        
+        # Track conversation structure
+        conversation: List[Tuple[str, List[str]]] = []  # [(speaker, tokens)]
+        current_speaker_idx = 0
+        current_turn_tokens: List[str] = []
+        alpha_count_turn = 0
+        
+        global_token_count = 0
 
         for i in range(total_steps):
             # Advance X linearly from start_x to 1.0 based on progress
@@ -1080,17 +1095,56 @@ class NeuroSymbolicGraphGenerator:
             p = p / (p.sum() + 1e-12)
             idx = rng.choice(len(cand), p=p)
             tok = cand[idx]
-            out_tokens.append(tok)
+            current_turn_tokens.append(tok)
 
             w1, w2, w3 = w2, w3, tok
             if re.match(r"[A-Za-z]", tok):
-                alpha_count += 1
-            if tok in {".", "!", "?"} and alpha_count >= 40:
-                # Stop if we are late in the sequence and hit punctuation
-                if i > total_steps * 0.75:
-                    break
-
-        return detokenize(out_tokens)
+                alpha_count_turn += 1
+            
+            global_token_count += 1
+            
+            # Check if we should switch speakers
+            should_switch = False
+            
+            # Switch after sentence-ending punctuation if we've generated enough tokens
+            if tok in {".", "!", "?"} and alpha_count_turn >= min(tokens_per_turn * 0.6, 20):
+                should_switch = True
+            
+            # Force switch if turn is too long
+            elif len(current_turn_tokens) >= tokens_per_turn * 1.5:
+                should_switch = True
+            
+            # Or if we've hit a natural boundary with enough content
+            elif len(current_turn_tokens) >= tokens_per_turn and alpha_count_turn >= 15:
+                if tok in {",", ";", ":"} or (i > 0 and rng.random() < 0.3):
+                    should_switch = True
+            
+            if should_switch and current_turn_tokens:
+                # Save current speaker's turn
+                speaker = speaker_labels[current_speaker_idx]
+                conversation.append((speaker, list(current_turn_tokens)))
+                
+                # Switch to next speaker
+                current_speaker_idx = (current_speaker_idx + 1) % num_speakers
+                current_turn_tokens = []
+                alpha_count_turn = 0
+        
+        # Add any remaining tokens as final turn
+        if current_turn_tokens:
+            speaker = speaker_labels[current_speaker_idx]
+            conversation.append((speaker, current_turn_tokens))
+        
+        # Format as conversational dialogue
+        return self._format_conversation(conversation)
+    
+    def _format_conversation(self, conversation: List[Tuple[str, List[str]]]) -> str:
+        """Format conversation turns into readable dialogue."""
+        lines = []
+        for speaker, tokens in conversation:
+            text = detokenize(tokens)
+            if text.strip():
+                lines.append(f"{speaker}: {text}")
+        return "\n\n".join(lines)
 
 
 # ----------------------------
@@ -1109,7 +1163,7 @@ def _load_corpus(use_hf: bool, hf_dataset: str, hf_split: str, hf_max_rows: int,
         return load_text(_resolve_gradio_file_to_path(infile))
 
 def run_generate(infile, use_hf, hf_dataset, hf_split, hf_max_rows,
-                 prompt, seed, x_start, max_tokens,
+                 prompt, seed, x_start, max_tokens, num_speakers, tokens_per_turn,
                  steer, focus, pairwise, oscs, boot_epochs,
                  progress=gr.Progress()):
     try:
@@ -1133,23 +1187,27 @@ def run_generate(infile, use_hf, hf_dataset, hf_split, hf_max_rows,
     prep = gen.prepare_corpus(corpus_text, progress=progress)
 
     header = (
-        f"[STATE]\n"
+        f"[CONVERSATIONAL GENERATION]\n"
         f"Tokens: {len(prep.tokens)}\n"
+        f"Speakers: {num_speakers}\n"
+        f"Tokens per turn: ~{tokens_per_turn}\n"
         f"Aesthetic flow (graph): {prep.state.semantic_graph.get_aesthetic_flow():.3f}\n"
         f"Activator global_mean4: {prep.state.activator.global_mean4.detach().cpu().numpy()}\n"
-        f"{'-'*40}\n\n"
+        f"{'-'*60}\n\n"
     )
-    txt = gen.generate(prep, prompt=str(prompt), start_x=float(x_start), max_tokens=int(max_tokens), seed=int(seed))
+    txt = gen.generate(prep, prompt=str(prompt), start_x=float(x_start), max_tokens=int(max_tokens), 
+                      seed=int(seed), num_speakers=int(num_speakers), tokens_per_turn=int(tokens_per_turn))
     return header + txt
 
 def build_app():
-    with gr.Blocks(title="NeuroSymbolic V6.1") as demo:
+    with gr.Blocks(title="NeuroSymbolic V6.1 - Conversational") as demo:
         gr.Markdown(
-            "# NeuroSymbolic V6.1: Dynamic Flow Control\n"
-            "**Max Tokens Slider**: Sets the sequence length. As generation proceeds up to this limit, "
-            "the dataset position \\(x\\) advances linearly from your Start Position toward 1.0.\n\n"
-            "This allows the Neuronal Activator to shift its aesthetic preferences (e.g., from 'Problem' to 'Solution' flow) "
-            "dynamically during the sentence."
+            "# NeuroSymbolic V6.1: Conversational Format\n"
+            "**NEW**: Each generated segment represents a different conversational entity (Speaker A, Speaker B, etc.).\n"
+            "The generator creates turn-taking dialogue where speakers exchange ideas based on the corpus.\n\n"
+            "**Max Tokens Slider**: Sets the total sequence length across all speakers.\n"
+            "**Number of Speakers**: How many conversational entities to simulate (2-5).\n"
+            "**Tokens per Turn**: Approximate length of each speaker's turn before switching."
         )
 
         with gr.Row():
@@ -1169,21 +1227,22 @@ def build_app():
             with gr.Column(scale=2):
                 tabs = gr.Tabs()
 
-                with gr.TabItem("Generate"):
-                    prompt = gr.Textbox(label="Prompt", value="explain this?", lines=3)
+                with gr.TabItem("Generate Conversation"):
+                    prompt = gr.Textbox(label="Conversation starter", value="What is knowledge?", lines=3)
                     seed = gr.Number(value=42, label="Seed")
 
-                    # NEW SLIDER REQUESTED
-                    max_tokens = gr.Slider(10, 1000, value=250, step=10, label="Max Tokens Slider")
+                    max_tokens = gr.Slider(10, 1000, value=300, step=10, label="Max Tokens (total across all speakers)")
+                    num_speakers = gr.Slider(2, 5, value=2, step=1, label="Number of Speakers")
+                    tokens_per_turn = gr.Slider(20, 150, value=50, step=5, label="Tokens per Turn (approx)")
 
                     x_start = gr.Slider(0, 1, value=0.5, step=0.01, label="Start Position (x)")
 
-                    out_txt = gr.Textbox(label="Output", lines=22)
-                    btn = gr.Button("Run generator", variant="primary")
+                    out_txt = gr.Textbox(label="Conversation Output", lines=22)
+                    btn = gr.Button("Generate Conversation", variant="primary")
                     btn.click(
                         run_generate,
                         inputs=[infile, use_hf, hf_dataset, hf_split, hf_max_rows,
-                                prompt, seed, x_start, max_tokens,
+                                prompt, seed, x_start, max_tokens, num_speakers, tokens_per_turn,
                                 steer, focus, pairwise, oscs, boot_epochs],
                         outputs=out_txt
                     )

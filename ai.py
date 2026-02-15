@@ -2,28 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-NeuroSymbolic V6.1 - Multi-Entity Problem Solving
-- Max Tokens Slider: Controls sequence length and x-axis advancement.
-- Neuronal Activator: Differentiable aesthetic weight generator.
-- Problem Flow Gradients: Positional scalars [0,1] modulate firing rates.
-- NEW: Multi-entity problem solving with specialized roles
-
-PROBLEM-SOLVING ROLES:
-- Problem Poser (flow: 0.0-0.25): Frames questions and identifies challenges
-- Analyzer (flow: 0.2-0.45): Examines details and breaks down components  
-- Solution Proposer (flow: 0.4-0.7): Suggests approaches and methods
-- Critic (flow: 0.5-0.75): Identifies issues and challenges proposals
-- Synthesizer (flow: 0.7-1.0): Integrates insights and draws conclusions
-
-Each role operates at different positions in the problem→solution flow space,
-creating natural progression through collaborative problem-solving.
-
-ADDED (V6.1+): Hemicontinuity regularizer for discrete correspondences
-- Treats x_pos -> Gamma(x_pos) as a set-valued mapping where Gamma returns TopK candidates.
-- Adds a soft penalty and optional smoothing to discourage discontinuous jumps in candidate support.
-
-Deps:
-  pip install gradio numpy torch datasets
+NeuroSymbolic V6.5 - Single Session Generator
+Features:
+- Single-Entity Problem Solving (One Session)
+- Neurosymbolic Graph Generation
+- Streamlined UI (No comparisons, no decision analysis)
 """
 
 from __future__ import annotations
@@ -31,10 +14,10 @@ from __future__ import annotations
 import re
 import math
 import hashlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Any
-from collections import OrderedDict
+from collections import OrderedDict, Counter
 
 import numpy as np
 import gradio as gr
@@ -45,7 +28,7 @@ from datasets import load_dataset
 
 
 # ----------------------------
-# CORE SYMBOLIC ENGINE (Targets)
+# CORE SYMBOLIC ENGINE
 # ----------------------------
 
 @dataclass
@@ -93,15 +76,10 @@ class SymbolicPair:
 
 
 # ----------------------------
-# DIFFERENTIABLE POSITION + ACTIVATOR
+# ACTIVATOR NETWORK
 # ----------------------------
 
 class NeuronalActivator(nn.Module):
-    """
-    Differentiable replacement for "pairwise cache weight":
-      (t1, t2, x_pos) -> predicted aesthetic vec (4) -> weight
-    Bootstraps on corpus bigrams by regressing to SymbolicPair aesthetics.
-    """
     def __init__(self, vocab_size: int = 50000, emb_dim: int = 64, hidden: int = 96,
                  pos_fourier: int = 16):
         super().__init__()
@@ -111,7 +89,7 @@ class NeuronalActivator(nn.Module):
 
         self.emb = nn.Embedding(self.vocab_size, self.emb_dim)
 
-        in_dim = 2 * self.emb_dim + 2 * self.pos_fourier  # token1, token2, sin/cos
+        in_dim = 2 * self.emb_dim + 2 * self.pos_fourier
         self.mlp = nn.Sequential(
             nn.Linear(in_dim, hidden),
             nn.LayerNorm(hidden),
@@ -139,10 +117,6 @@ class NeuronalActivator(nn.Module):
         return torch.tensor(ids, dtype=torch.long, device=device)
 
     def _pos_fourier(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: shape [] or [B], in [0,1]
-        returns: [B, 2*pos_fourier]
-        """
         if x.dim() == 0:
             x = x.view(1)
         freqs = torch.arange(1, self.pos_fourier + 1, device=x.device, dtype=x.dtype) * (2.0 * math.pi)
@@ -150,12 +124,6 @@ class NeuronalActivator(nn.Module):
         return torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1)
 
     def predict_vec4(self, t1_ids: torch.LongTensor, t2_ids: torch.LongTensor, x_pos: torch.Tensor) -> torch.Tensor:
-        """
-        t1_ids: [B]
-        t2_ids: [B]
-        x_pos:  [] or [B] in [0,1]
-        returns vec4: [B,4] in [0,1] (sigmoid)
-        """
         e1 = self.emb(t1_ids)
         e2 = self.emb(t2_ids)
         pf = self._pos_fourier(x_pos.to(dtype=e1.dtype))
@@ -166,10 +134,6 @@ class NeuronalActivator(nn.Module):
         return vec4
 
     def weight_from_vec4(self, vec4: torch.Tensor) -> torch.Tensor:
-        """
-        vec4: [B,4], global_mean4: [4]
-        returns weight: [B]
-        """
         d = torch.linalg.norm(vec4 - self.global_mean4.view(1, 4), dim=-1)
         return torch.exp(-d)
 
@@ -178,9 +142,6 @@ class NeuronalActivator(nn.Module):
         self.global_mean4.copy_(vec4_all.mean(dim=0).clamp(0.0, 1.0))
 
     def forward_weight(self, t1: str, t2_list: List[str], x_pos: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Convenience: t1 string + list of t2 strings -> (weights[B], vec4[B,4])
-        """
         device = self.emb.weight.device
         t1_ids = self.token_ids([t1] * len(t2_list), device=device)
         t2_ids = self.token_ids(t2_list, device=device)
@@ -190,15 +151,9 @@ class NeuronalActivator(nn.Module):
 
     def bootstrap_on_tokens(self, tokens: List[str], epochs: int = 25, lr: float = 3e-3,
                             max_pairs: int = 4000, progress=None) -> Dict[str, float]:
-        """
-        Supervised bootstrap:
-          input: (t_i, t_{i+1}, x_pos=i/(N-1))
-          target: SymbolicPair aesthetics vec4
-        """
         if len(tokens) < 2:
             return {"pairs": 0, "loss": 0.0}
 
-        # Build unique pairs with positions
         N = len(tokens)
         pairs = []
         for i in range(N - 1):
@@ -213,8 +168,9 @@ class NeuronalActivator(nn.Module):
         if not pairs:
             return {"pairs": 0, "loss": 0.0}
 
-        # Targets from V4 SymbolicPair
-        y = torch.tensor([SymbolicPair.from_tokens(a, b).aesthetic_vector() for a, b, _ in pairs], dtype=torch.float32)
+        vecs = [SymbolicPair.from_tokens(a, b).aesthetic_vector() for a, b, _ in pairs]
+        y = torch.tensor(np.array(vecs), dtype=torch.float32)
+        
         self.update_global_mean(y)
 
         device = self.emb.weight.device
@@ -245,15 +201,13 @@ class NeuronalActivator(nn.Module):
                 ep_loss += float(loss.item())
 
             losses.append(ep_loss / max(1, math.ceil(len(pairs) / bs)))
-            if progress and (ep == 0 or (ep + 1) % 5 == 0):
-                progress(0.10 + 0.15 * (ep + 1) / max(1, epochs), desc=f"Bootstrapping activator (loss {losses[-1]:.4f})")
 
         self.eval()
         return {"pairs": len(pairs), "loss": float(losses[-1]) if losses else 0.0}
 
 
 # ----------------------------
-# V4 CONSTANTS / PATTERNS
+# CONSTANTS & UTILS
 # ----------------------------
 
 COGNITIVE_TOKENS = {
@@ -274,21 +228,12 @@ STOP_WORDS = set(
 PROBLEM_PATTERNS = [
     r"(?:problem|issue|challenge|difficulty|question|dilemma|paradox|conundrum|puzzle|obstacle)[s]?\s*(?:of|in|with|for|to)?\s*(?:the\s+)?(?:\w+\s*){0,10}\?",
     r"(?:what|how|why|when|where)\s+\w+\s+(?:problem|issue|challenge|question)[s]?\??",
-    r"(?:solve|address|overcome|tackle|resolve)\s+(?:the\s+)?(?:problem|issue|challenge)[s]?\s*(?:of|in|with)?",
-    r"(?:facing|encounter|meet|confront)\s+(?:the\s+)?(?:problem|issue|difficulty)[s]?\s*(?:of|with)?",
 ]
 
 SOLUTION_PATTERNS = [
     r"(?:solution|answer|resolution|fix|remedy|approach|method|strategy|technique)[s]?\s*(?:is|are|to|for|of)?\s*(?:the\s+)?(?:\w+\s*){0,8}(?:\.|:)",
     r"(?:solved|resolved|fixed|addressed|overcome|tackled)\s+(?:by|using|through|with)\s*(?:the\s+)?(?:\w+\s*){0,10}",
-    r"(?:key|best|optimal|effective)\s+(?:solution|approach|strategy|method)[s]?\s*(?:is|are|:)",
-    r"(?:this|it)\s+(?:can|may|might|should|will)\s+be\s+(?:solved|addressed|resolved)\s+(?:by|using|with)",
 ]
-
-
-# ----------------------------
-# TEXT PROCESSING
-# ----------------------------
 
 def inject_cognitive_tokens(text: str) -> str:
     lines = text.split("\n")
@@ -363,29 +308,12 @@ def load_text(path: str) -> str:
         return p.read_text(encoding="utf-8", errors="replace")
     raise ValueError("Unsupported file extension")
 
-def _resolve_gradio_file_to_path(infile) -> str:
-    if infile is None:
-        raise ValueError("No input file provided.")
-    if isinstance(infile, str):
-        return infile
-    if hasattr(infile, "name") and isinstance(infile.name, str):
-        return infile.name
-    if isinstance(infile, dict) and "path" in infile:
-        return str(infile["path"])
-    if hasattr(infile, "path"):
-        return str(infile.path)
-    raise ValueError(f"Unsupported infile type: {type(infile)}")
-
 
 # ----------------------------
-# PROBLEM FLOW FIELD (token -> [0,1])
+# FLOW & GRAPH
 # ----------------------------
 
 def compute_problem_flow_by_token(tokens: List[str]) -> Dict[str, float]:
-    """
-    Estimate token's typical position between [PROBLEM] and [SOLUTION].
-    0=near problem start, 1=near solution marker.
-    """
     acc: Dict[str, List[float]] = {}
     in_seg = False
     seg_start = None
@@ -407,11 +335,6 @@ def compute_problem_flow_by_token(tokens: List[str]) -> Dict[str, float]:
             seg_start = None
     return {t: float(sum(v) / len(v)) for t, v in acc.items()}
 
-
-# ----------------------------
-# PURE TF-IDF + SVD (as in V4)
-# ----------------------------
-
 def pure_tfidf(docs: List[str], max_features: int = 8000) -> Tuple[np.ndarray, List[str]]:
     all_words = set()
     for doc in docs:
@@ -419,7 +342,6 @@ def pure_tfidf(docs: List[str], max_features: int = 8000) -> Tuple[np.ndarray, L
         all_words.update(words)
     vocab = list(all_words)[:max_features]
     word_to_idx = {w: i for i, w in enumerate(vocab)}
-
     X = np.zeros((len(docs), len(vocab)), dtype=np.float32)
     for i, doc in enumerate(docs):
         word_counts = {}
@@ -443,29 +365,22 @@ def pure_truncated_svd(X: np.ndarray, n_components: int, random_state: int = 42)
     k = min(n_components, min(m, n))
     if k < 1:
         return type("SVD", (), {"components_": np.zeros((0, n), dtype=np.float32)})()
-
     Q = np.random.randn(n, k).astype(np.float32)
     Q, _ = np.linalg.qr(Q)
-
     for _ in range(10):
         B = X.T @ X @ Q
         Q, _ = np.linalg.qr(B)
-
     B = X @ Q
     U, S, Vt = np.linalg.svd(B, full_matrices=False)
     return type("SVD", (), {"components_": Vt[:k].astype(np.float32)})()
 
-
-# ----------------------------
-# GRAPH (stores predicted vec4 for edges)
-# ----------------------------
 
 @dataclass
 class SimpleGraph:
     nodes: List[Dict[str, Any]]
     edges: List[Tuple[int, int, Dict[str, Any]]]
     cognitive_map: Dict[str, List[int]]
-    pairwise_aesthetics: Dict[Tuple[int, int], torch.Tensor]  # vec4 on each adj edge
+    pairwise_aesthetics: Dict[Tuple[int, int], torch.Tensor]
 
     @classmethod
     def from_token_sequence(cls, tokens: List[str], activator: NeuronalActivator,
@@ -475,8 +390,6 @@ class SimpleGraph:
         edges = []
         cog_map = {"[PROBLEM]": [], "[SOLUTION]": [], "[PAIR-BEGIN]": [], "[PAIR-END]": []}
         aest = {}
-
-        # Use activator to predict vec4 per adjacent pair
         if len(toks) >= 2:
             device = activator.emb.weight.device
             x = torch.tensor(float(x_pos_default), dtype=torch.float32, device=device)
@@ -485,14 +398,11 @@ class SimpleGraph:
                 t1, t2 = toks[i], toks[i + 1]
                 w, vec4 = activator.forward_weight(t1, [t2], x_pos=x)
                 aest[(i, i + 1)] = vec4[0].detach().cpu()
-
         for i in range(len(toks) - 2):
             edges.append((i, i + 2, {"rel": "skip"}))
-
         for i, t in enumerate(toks):
             if t in COGNITIVE_TOKENS:
                 cog_map[t].append(i)
-
         return cls(nodes, edges, cog_map, aest)
 
     def get_aesthetic_flow(self) -> float:
@@ -501,18 +411,12 @@ class SimpleGraph:
         vecs = list(self.pairwise_aesthetics.values())
         if not vecs:
             return 0.5
-        V = torch.stack(vecs, dim=0)  # [E,4]
+        V = torch.stack(vecs, dim=0)
         return float(torch.mean(torch.linalg.norm(V, dim=1)).item())
-
-def graph_signature(G: SimpleGraph) -> Dict[str, object]:
-    return {
-        "cognitive_density": sum(len(v) for v in G.cognitive_map.values()),
-        "aesthetic_flow": G.get_aesthetic_flow(),
-    }
 
 
 # ----------------------------
-# FUZZY CONTROLLER (differentiable)
+# FUZZY LOGIC
 # ----------------------------
 
 def mf_tri(x: torch.Tensor, a: float, b: float, c: float) -> torch.Tensor:
@@ -549,22 +453,17 @@ class FuzzyWeightController(nn.Module):
         b = boost01.clamp(0, 1)
         a = aesthetic_flow01.clamp(0, 1)
 
-        # Memberships
         e_low  = mf_trap(e, 0.0, 0.0, 0.25, 0.45)
         e_mid  = mf_tri(e, 0.25, 0.50, 0.75)
         e_high = mf_trap(e, 0.55, 0.75, 1.0, 1.0)
-
         p_low  = mf_trap(p, 0.0, 0.0, 0.20, 0.40)
         p_mid  = mf_tri(p, 0.25, 0.50, 0.75)
         p_high = mf_trap(p, 0.60, 0.80, 1.0, 1.0)
-
         b_low  = mf_trap(b, 0.0, 0.0, 0.20, 0.45)
         b_mid  = mf_tri(b, 0.25, 0.50, 0.75)
         b_high = mf_trap(b, 0.55, 0.80, 1.0, 1.0)
-
         a_high = mf_trap(a, 0.5, 0.7, 1.0, 1.0)
 
-        # Rules
         w1 = tnorm_prod(e_high, p_low)
         w2 = tnorm_prod(e_mid, b_mid)
         w3 = snorm_max(p_high, b_high)
@@ -574,22 +473,15 @@ class FuzzyWeightController(nn.Module):
         Z = torch.tensor([self.z_high, self.z_mid, self.z_low, self.z_low, self.z_high],
                          device=e.device, dtype=torch.float32)
         W = torch.stack([w1, w2, w3, w4, w5]).to(dtype=torch.float32).clamp_min(0.0)
-
         g = (W * Z).sum() / (W.sum() + 1e-12)
-
         s = float(osculator_strength)
         if math.isfinite(s) and s > 0.0:
             s = max(0.0, min(1.0, s))
             osc = 1.0 - ((g - 0.5) / 0.5) ** 2
             osc = osc.clamp(0.0, 1.0)
             g = (1.0 - s) * g + s * osc
-
         return g.clamp(0.0, 0.5)
 
-
-# ----------------------------
-# OTHER NEURAL UTILITIES
-# ----------------------------
 
 class LateralInhibition(nn.Module):
     def __init__(self, kernel_size=7, strength=0.5):
@@ -611,7 +503,7 @@ class LateralInhibition(nn.Module):
 
 
 # ----------------------------
-# QUADGRAM LM (counts)
+# LANGUAGE MODEL
 # ----------------------------
 
 class QuadgramLM:
@@ -664,7 +556,6 @@ class QuadgramLM:
                 seen.add(w)
                 cand.append(w)
         cand = cand[:500]
-
         V = len(self.vocab) + 1
         add_k = self.add_k
 
@@ -692,27 +583,15 @@ class QuadgramLM:
         return cand, probs
 
 
-# ----------------------------
-# HEMICONTINUITY (discrete analogue)
-# ----------------------------
-
 class DiscreteHemiContinuity(nn.Module):
-    """
-    Practical hemicontinuity-inspired regularizer for the discrete correspondence:
-        Gamma(x) = TopK(final_probs(x))
-    Upper hemicontinuity intuition: small change in x should not suddenly add faraway mass/support.
-    Lower hemicontinuity intuition: small change in x should not suddenly lose previously-supported points.
-    These match the open-set based definitions for correspondences at a conceptual level.
-    """
     def __init__(self, top_k: int = 64, mass_eps: float = 1e-4, penalty_strength: float = 0.15, smooth_alpha: float = 0.05):
         super().__init__()
         self.top_k = int(top_k)
         self.mass_eps = float(mass_eps)
         self.penalty_strength = float(penalty_strength)
         self.smooth_alpha = float(smooth_alpha)
-
         self._prev_cand: Optional[List[str]] = None
-        self._prev_probs: Optional[torch.Tensor] = None  # [N_prev] on same device as current
+        self._prev_probs: Optional[torch.Tensor] = None
         self._prev_index: Optional[Dict[str, int]] = None
 
     def reset(self):
@@ -728,17 +607,9 @@ class DiscreteHemiContinuity(nn.Module):
         return m
 
     def apply(self, cand: List[str], probs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Returns:
-          probs_adj: adjusted probs (same shape)
-          hemi_pen: scalar penalty (detached)
-        """
         if probs.dim() != 1:
             raise ValueError("DiscreteHemiContinuity expects 1D probs")
-
         hemi_pen = torch.tensor(0.0, device=probs.device, dtype=probs.dtype)
-
-        # First step: just store
         if self._prev_cand is None or self._prev_probs is None or self._prev_index is None:
             self._prev_cand = list(cand)
             self._prev_probs = probs.detach().clone()
@@ -747,29 +618,21 @@ class DiscreteHemiContinuity(nn.Module):
 
         prev_index = self._prev_index
         prev_probs = self._prev_probs.to(device=probs.device, dtype=probs.dtype)
-
-        # Align previous probs onto current cand space (missing -> 0)
         prev_on_curr = torch.zeros_like(probs)
         for i, w in enumerate(cand):
             j = prev_index.get(w, None)
             if j is not None and j < prev_probs.numel():
                 prev_on_curr[i] = prev_probs[j]
 
-        # Define neighborhoods via TopK masks
         prev_mask = self._topk_mask(prev_on_curr, self.top_k)
         curr_mask = self._topk_mask(probs, self.top_k)
-
-        # Upper-hemi analogue: penalize new support outside prev neighborhood
         new_outside = curr_mask & (~prev_mask)
         upper_violation_mass = probs[new_outside].sum()
         hemi_pen = hemi_pen + upper_violation_mass
-
-        # Lower-hemi analogue: penalize lost support that used to matter
         lost = prev_mask & (~curr_mask)
         lower_violation_mass = prev_on_curr[lost].sum()
         hemi_pen = hemi_pen + lower_violation_mass
 
-        # Optional smoothing: keep some probability on the previous neighborhood
         if self.smooth_alpha > 0.0:
             alpha = float(self.smooth_alpha)
             probs_adj = probs * (1.0 - alpha) + prev_on_curr * alpha
@@ -777,16 +640,14 @@ class DiscreteHemiContinuity(nn.Module):
         else:
             probs_adj = probs
 
-        # Update memory
         self._prev_cand = list(cand)
         self._prev_probs = probs_adj.detach().clone()
         self._prev_index = {w: i for i, w in enumerate(self._prev_cand)}
-
         return probs_adj, (self.penalty_strength * hemi_pen).detach()
 
 
 # ----------------------------
-# STATE & CACHE
+# DATA STRUCTURES & CACHE
 # ----------------------------
 
 @dataclass
@@ -814,7 +675,6 @@ class PreparedCorpus:
     tokens: List[str]
     state: ModelState
 
-
 class RadixLRUCache:
     def __init__(self, max_items: int = 25000):
         self.max_items = int(max(256, max_items))
@@ -836,9 +696,20 @@ class RadixLRUCache:
     def clear(self):
         self._od.clear()
 
+@dataclass
+class GenerationMetrics:
+    role_token_counts: Dict[str, int]
+    role_avg_flow: Dict[str, float]
+    keyword_usage: Counter
+    sentence_lengths: List[int]
+    question_count: int
+    assertion_count: int
+    avg_aesthetic_flow: float
+    total_tokens: int
+
 
 # ----------------------------
-# GENERATOR (CONVERSATIONAL FORMAT)
+# MAIN GENERATOR
 # ----------------------------
 
 class NeuroSymbolicGraphGenerator:
@@ -867,14 +738,10 @@ class NeuroSymbolicGraphGenerator:
         self.pairwise_strength = float(pairwise_strength)
         self.osculator_strength = float(osculator_strength)
         self.activator_boot_epochs = int(activator_boot_epochs)
-
         self.focus_layer = LateralInhibition(strength=float(focus_strength))
         self.fuzzy_ctl = FuzzyWeightController()
-
         self.cache = RadixLRUCache(max_items=20000)
         self.cache_version = 0
-
-        # Hemicontinuity regularizer (discrete analogue of UHC/LHC for correspondences).
         self.hemi_enable = bool(hemi_enable)
         self.hemi = DiscreteHemiContinuity(
             top_k=int(hemi_top_k),
@@ -884,45 +751,28 @@ class NeuroSymbolicGraphGenerator:
 
     def _pick_initial_context(self, lm: QuadgramLM, seed_words: List[str]) -> Tuple[str, str, str]:
         sw = [t for t in seed_words if re.match(r"^[a-z][a-z0-9_'-]*$", t) and t not in COGNITIVE_TOKENS]
-        if len(sw) >= 3:
-            return (sw[-3], sw[-2], sw[-1])
-        if len(sw) == 2:
-            return (sw[-2], sw[-1], sw[-1])
-        if len(sw) == 1:
-            return (sw[-1], sw[-1], sw[-1])
+        if len(sw) >= 3: return (sw[-3], sw[-2], sw[-1])
+        if len(sw) == 2: return (sw[-2], sw[-1], sw[-1])
+        if len(sw) == 1: return (sw[-1], sw[-1], sw[-1])
         seed_tok = lm.vocab[0] if lm.vocab else "the"
         return (seed_tok, seed_tok, seed_tok)
 
     def build_state(self, text: str, progress=None) -> ModelState:
-        # Prepare tokens early (needed for activator bootstrap + flow field)
         tokens = basic_tokenize(text)
         flow_by_token = compute_problem_flow_by_token(tokens)
-
-        # LM
         lm = QuadgramLM(add_k=self.lm_add_k)
         lm.ingest(tokens)
-
-        # Token boost table (same spirit as V4: important tokens get higher boosts)
         token_boost: Dict[str, float] = {}
         for tok, boost_val in COGNITIVE_TOKENS.items():
             token_boost[tok] = boost_val
-
-        # Activator + bootstrap to mimic SymbolicPair
         activator = NeuronalActivator()
-        if torch.cuda.is_available():
-            activator = activator.cuda()
-        if progress:
-            progress(0.02, desc="Bootstrapping activator")
+        if torch.cuda.is_available(): activator = activator.cuda()
         activator.bootstrap_on_tokens(tokens, epochs=self.activator_boot_epochs, progress=progress)
-
-        # Graph aesthetic flow (computed using activator)
         G = SimpleGraph.from_token_sequence(tokens, activator, max_nodes=220, x_pos_default=0.5)
 
-        # Minimal "nodelets" retained (TF-IDF+SVD like V4), but we keep it lightweight here
         clean_text = text.replace("[PROBLEM]", "").replace("[SOLUTION]", "").replace("[PAIR-BEGIN]", "").replace("[PAIR-END]", "")
         docs = re.split(r"\n\s*\n", clean_text)[:500]
         X, vocab = pure_tfidf(docs, max_features=8000)
-
         nodelets: List[Nodelet] = []
         vocab100: List[str] = []
         W = torch.zeros(0, 0)
@@ -935,14 +785,11 @@ class NeuroSymbolicGraphGenerator:
             n_rows, n_cols = X_svd.shape
             max_rank = min(n_rows, n_cols)
             k = 1 if max_rank <= 1 else min(self.nodelets_n, max_rank, 10)
-
             svd = pure_truncated_svd(X_svd, n_components=k, random_state=self.svd_random_state)
             for i, comp in enumerate(svd.components_):
-                terms = sorted([(vocab100[j], float(comp[j])) for j in range(len(comp))],
-                               key=lambda x: -abs(x[1]))[:10]
+                terms = sorted([(vocab100[j], float(comp[j])) for j in range(len(comp))], key=lambda x: -abs(x[1]))[:10]
                 eng = float(np.linalg.norm(comp))
                 nodelets.append(Nodelet(i, terms, eng, f"Nodelet {i}"))
-
             W = torch.tensor(svd.components_, dtype=torch.float32)
             W = F.relu(W)
             if W.numel() > 0:
@@ -952,8 +799,6 @@ class NeuroSymbolicGraphGenerator:
                 logits = (energies.view(-1, 1) * W).sum(dim=0)
                 probs = F.softmax(logits / max(self.softmax_temp, 1e-6), dim=-1)
                 probs = self.focus_layer(probs.view(1, 1, -1)).squeeze(0).squeeze(0)
-
-            # inject boosts based on probs (V4 style)
             for w, p in zip(vocab100, probs.detach().cpu().tolist()):
                 for subw in w.split():
                     if len(subw) > 2 and subw not in STOP_WORDS:
@@ -976,37 +821,23 @@ class NeuroSymbolicGraphGenerator:
         text = normalize(text)
         state = self.build_state(text, progress=progress)
         tokens = basic_tokenize(text)
-
-        # Reset hemicontinuity memory for new corpus run
-        if self.hemi_enable:
-            self.hemi.reset()
-
+        if self.hemi_enable: self.hemi.reset()
         return PreparedCorpus(text=text, tokens=tokens, state=state)
 
     def _final_probs(self, prep: PreparedCorpus, w1: str, w2: str, w3: str,
                      x_pos: torch.Tensor, allow_cache: bool = True) -> Tuple[List[str], torch.Tensor, torch.Tensor]:
-        """
-        Returns:
-          cand: list[str]
-          final_probs: [B]
-          flow_vec: [B]  (candidate flow score in [0,1])
-        """
-        # Cache only when x_pos is a plain float tensor w/o grad
         cache_ok = allow_cache and (not x_pos.requires_grad) and (x_pos.numel() == 1)
-
         key = None
         if cache_ok:
             key = (self.cache_version, w1, w2, w3, float(x_pos.item()))
             cached = self.cache.get(key)
-            if cached is not None:
-                return cached
+            if cached is not None: return cached
 
         cand, base_probs = prep.state.lm.next_distribution(w1, w2, w3)
         base_p = base_probs.to(dtype=torch.float32)
         base_p = base_p / (base_p.sum() + 1e-12)
         base_p = self.focus_layer(base_p.view(1, 1, -1)).squeeze(0).squeeze(0)
 
-        # entropy / peak
         val = base_p.clamp_min(1e-12)
         H = -torch.sum(base_p * torch.log(val))
         V = float(base_p.numel())
@@ -1015,34 +846,24 @@ class NeuroSymbolicGraphGenerator:
 
         device = prep.state.activator.emb.weight.device
         x_pos = x_pos.to(device=device, dtype=torch.float32).clamp(0.0, 1.0)
+        boosts = torch.tensor([prep.state.token_boost.get(w, 0.0) for w in cand], dtype=torch.float32, device=device)
 
-        boosts = torch.tensor([prep.state.token_boost.get(w, 0.0) for w in cand],
-                              dtype=torch.float32, device=device)
-
-        # differentiable pairwise weights from activator
         w_pair, _vec4 = prep.state.activator.forward_weight(w3, cand, x_pos=x_pos)
         w_pair = w_pair / (w_pair.mean() + 1e-12)
         boosts = boosts + self.pairwise_strength * w_pair
 
-        # V4-style "gravity" + continuous problem flow
         context_str = f"{w1} {w2} {w3}"
         gravity = 0.0
-        if "[PROBLEM]" in context_str:
-            gravity = 0.2
-        if "[SOLUTION]" in context_str:
-            gravity = 0.3
+        if "[PROBLEM]" in context_str: gravity = 0.2
+        if "[SOLUTION]" in context_str: gravity = 0.3
         flow_w3 = float(prep.state.problem_flow_by_token.get(w3, 0.0))
         flow_w3_t = torch.tensor(flow_w3, dtype=torch.float32, device=device)
-
         boost01 = torch.tanh((boosts.abs().mean() + gravity + flow_w3_t) / 3.0).clamp(0.0, 1.0)
-
-        # graph flow + x_pos coupling (keeps "aesthetic_flow" as a factor)
         base_flow = float(prep.state.semantic_graph.get_aesthetic_flow())
         base_flow_t = torch.tensor(base_flow, dtype=torch.float32, device=device).clamp(0.0, 1.0)
         aesthetic_flow01 = (base_flow_t * (0.5 + 0.5 * x_pos)).clamp(0.0, 1.0)
 
         g = self.fuzzy_ctl(entropy01, peak01, boost01, aesthetic_flow01, osculator_strength=self.osculator_strength)
-
         effective_steer = self.base_steer * g
         effective_temp = self.base_temp * (1.2 - 0.7 * g)
 
@@ -1050,179 +871,190 @@ class NeuroSymbolicGraphGenerator:
         potentials = potentials / torch.clamp(effective_temp, min=1e-6)
         final_probs = F.softmax(potentials, dim=-1)
 
-        # Hemicontinuity stabilization (discrete analogue of UHC/LHC).
         hemi_pen = torch.tensor(0.0, device=device, dtype=final_probs.dtype)
         if self.hemi_enable:
             final_probs, hemi_pen = self.hemi.apply(cand, final_probs)
-
-        # flow score per candidate token (used for pos->grad)
-        flow_vec = torch.tensor([prep.state.problem_flow_by_token.get(w, 0.0) for w in cand],
-                                dtype=torch.float32, device=device).clamp(0.0, 1.0)
+        flow_vec = torch.tensor([prep.state.problem_flow_by_token.get(w, 0.0) for w in cand], dtype=torch.float32, device=device).clamp(0.0, 1.0)
 
         out = (cand, final_probs, flow_vec)
-        if cache_ok and key is not None:
-            # cache detached copies only (inference speed)
-            self.cache.put(key, (cand, final_probs.detach(), flow_vec.detach()))
+        if cache_ok and key is not None: self.cache.put(key, (cand, final_probs.detach(), flow_vec.detach()))
         return out
 
     @torch.no_grad()
     def generate(self, prep: PreparedCorpus, prompt: str, start_x: float,
                  max_tokens: int = 220, seed: int = 42, num_speakers: int = 2,
-                 tokens_per_turn: int = 50, problem_solving_mode: bool = True) -> str:
-        """
-        Generate multi-entity problem-solving dialogue.
-        
-        Args:
-            num_speakers: Number of conversational entities (default 2)
-            tokens_per_turn: Approximate tokens per speaker turn (default 50)
-            problem_solving_mode: Use specialized problem-solving roles (default True)
-        """
+                 tokens_per_turn: int = 50, problem_solving_mode: bool = True,
+                 target_flow: Optional[float] = None) -> Tuple[str, GenerationMetrics]:
         rng = np.random.default_rng(int(seed))
         seed_toks = basic_tokenize(prompt)
         w1, w2, w3 = self._pick_initial_context(prep.state.lm, seed_toks)
-
         device = prep.state.activator.emb.weight.device
         total_steps = int(max_tokens)
         
-        # Define problem-solving roles with cognitive biases
-        if problem_solving_mode:
-            role_definitions = [
-                ("Problem Poser", 0.0, 0.25, "questioning", ["?", "what", "how", "why"]),
-                ("Analyzer", 0.2, 0.45, "analyzing", ["because", "consider", "examine", "observe"]),
-                ("Solution Proposer", 0.4, 0.7, "proposing", ["solution", "approach", "method", "could"]),
-                ("Critic", 0.5, 0.75, "critiquing", ["however", "but", "issue", "problem"]),
-                ("Synthesizer", 0.7, 1.0, "synthesizing", ["therefore", "thus", "overall", "combining"]),
-            ]
-            
-            # Cycle through roles based on num_speakers
-            speaker_roles = []
-            for i in range(int(num_speakers)):
-                role_idx = i % len(role_definitions)
-                speaker_roles.append(role_definitions[role_idx])
-        else:
-            # Generic speakers
-            speaker_roles = [(f"Speaker {chr(65 + i)}", 0.0, 1.0, "speaking", []) 
-                            for i in range(int(num_speakers))]
+        role_definitions = [
+            ("Problem Poser", 0.0, 0.25, "questioning", ["?", "what", "how", "why"]),
+            ("Analyzer", 0.2, 0.45, "analyzing", ["because", "consider", "examine", "observe"]),
+            ("Solution Proposer", 0.4, 0.7, "proposing", ["solution", "approach", "method", "could"]),
+            ("Critic", 0.5, 0.75, "critiquing", ["however", "but", "issue", "problem"]),
+            ("Synthesizer", 0.7, 1.0, "synthesizing", ["therefore", "thus", "overall", "combining"]),
+        ]
+        speaker_roles = []
+        for i in range(int(num_speakers)):
+            role_idx = i % len(role_definitions)
+            speaker_roles.append(role_definitions[role_idx])
         
-        # Track conversation structure with role metadata
-        conversation: List[Tuple[str, str, List[str], float]] = []  # [(role, mode, tokens, x_bias)]
+        conversation: List[Tuple[str, str, List[str], float]] = []
         current_speaker_idx = 0
         current_turn_tokens: List[str] = []
         alpha_count_turn = 0
         
-        # Inject cognitive tokens based on role
-        role_token_cache: Dict[str, List[str]] = {}
+        role_token_counts = {role[0]: 0 for role in speaker_roles}
+        role_flow_sums = {role[0]: 0.0 for role in speaker_roles}
+        role_flow_counts = {role[0]: 0 for role in speaker_roles}
+        keyword_usage = Counter()
+        sentence_lengths = []
+        question_count = 0
+        assertion_count = 0
+        aesthetic_flows = []
+        current_sentence_length = 0
 
         for i in range(total_steps):
-            # Get current role
             role_name, x_min, x_max, mode, keywords = speaker_roles[current_speaker_idx]
-            
-            # Role-based x position bias (blend global progress with role preference)
             progress = i / max(1, total_steps)
             global_x = start_x + (1.0 - start_x) * progress
             role_x_bias = (x_min + x_max) / 2.0
             
-            # Blend: 70% global progression, 30% role bias
-            curr_x_val = 0.7 * global_x + 0.3 * role_x_bias
-            curr_x_val = max(x_min, min(x_max, curr_x_val))  # Clamp to role range
+            if target_flow is not None:
+                curr_x_val = target_flow
+            else:
+                curr_x_val = 0.7 * global_x + 0.3 * role_x_bias
+                curr_x_val = max(x_min, min(x_max, curr_x_val))
             
             x = torch.tensor(float(curr_x_val), dtype=torch.float32, device=device)
-
             cand, probs, flow_vec = self._final_probs(prep, w1, w2, w3, x_pos=x, allow_cache=True)
             
-            # Role-based probability modulation
             if keywords and problem_solving_mode:
                 keyword_boost = torch.zeros_like(probs)
                 for idx, c in enumerate(cand):
                     if c.lower() in keywords:
                         keyword_boost[idx] = 0.3
-                    # Boost tokens with flow matching role preference
                     flow_match = 1.0 - abs(flow_vec[idx].item() - role_x_bias)
                     keyword_boost[idx] += 0.2 * flow_match
-                
                 probs = probs * torch.exp(keyword_boost)
                 probs = probs / (probs.sum() + 1e-12)
             
-            p = probs.detach().cpu().numpy()
-            p = p / (p.sum() + 1e-12)
-            idx = rng.choice(len(cand), p=p)
-            tok = cand[idx]
+            if target_flow is not None:
+                # ARGMAX FLOW
+                count = max(1, role_flow_counts[role_name])
+                running_avg = role_flow_sums[role_name] / count
+                k_top = 64
+                top_k_indices = torch.topk(probs, min(k_top, len(probs))).indices
+                best_score = -float('inf')
+                idx = top_k_indices[0].item()
+                for cand_idx in top_k_indices:
+                    cand_idx = int(cand_idx.item())
+                    next_avg = (running_avg * count + flow_vec[cand_idx].item()) / (count + 1)
+                    flow_penalty = 0.5 * abs(next_avg - target_flow)**2
+                    lm_score = math.log(probs[cand_idx].item() + 1e-12)
+                    score = lm_score - flow_penalty * 10.0
+                    if score > best_score:
+                        best_score = score
+                        idx = cand_idx
+                tok = cand[idx]
+            else:
+                p = probs.detach().cpu().numpy()
+                p = p / (p.sum() + 1e-12)
+                idx = rng.choice(len(cand), p=p)
+                tok = cand[idx]
+
             current_turn_tokens.append(tok)
+            role_token_counts[role_name] += 1
+            role_flow_sums[role_name] += flow_vec[idx].item()
+            role_flow_counts[role_name] += 1
+            aesthetic_flows.append(curr_x_val)
+            if tok.lower() in keywords: keyword_usage[tok.lower()] += 1
+            if tok == "?":
+                question_count += 1
+                sentence_lengths.append(current_sentence_length)
+                current_sentence_length = 0
+            elif tok in [".", "!"]:
+                assertion_count += 1
+                sentence_lengths.append(current_sentence_length)
+                current_sentence_length = 0
+            else:
+                current_sentence_length += 1
 
             w1, w2, w3 = w2, w3, tok
-            if re.match(r"[A-Za-z]", tok):
-                alpha_count_turn += 1
+            if re.match(r"[A-Za-z]", tok): alpha_count_turn += 1
             
-            # Check if we should switch speakers
             should_switch = False
-            
-            # Switch after sentence-ending punctuation if we've generated enough tokens
-            if tok in {".", "!", "?"} and alpha_count_turn >= min(tokens_per_turn * 0.6, 20):
-                should_switch = True
-            
-            # Force switch if turn is too long
-            elif len(current_turn_tokens) >= tokens_per_turn * 1.5:
-                should_switch = True
-            
-            # Or if we've hit a natural boundary with enough content
-            elif len(current_turn_tokens) >= tokens_per_turn and alpha_count_turn >= 15:
-                if tok in {",", ";", ":"} or (i > 0 and rng.random() < 0.3):
-                    should_switch = True
+            if tok in [".", "!", "?"] and alpha_count_turn >= min(tokens_per_turn * 0.6, 20): should_switch = True
+            elif len(current_turn_tokens) >= tokens_per_turn * 1.5: should_switch = True
+            elif len(current_turn_tokens) >= tokens_per_turn and alpha_count_turn > 15:
+                if tok in [",", ";"] or (i > 0 and rng.random() < 0.3): should_switch = True
             
             if should_switch and current_turn_tokens:
-                # Save current speaker's turn with role metadata
                 conversation.append((role_name, mode, list(current_turn_tokens), role_x_bias))
-                
-                # Switch to next speaker
                 current_speaker_idx = (current_speaker_idx + 1) % num_speakers
                 current_turn_tokens = []
                 alpha_count_turn = 0
         
-        # Add any remaining tokens as final turn
         if current_turn_tokens:
             role_name, x_min, x_max, mode, keywords = speaker_roles[current_speaker_idx]
             role_x_bias = (x_min + x_max) / 2.0
             conversation.append((role_name, mode, current_turn_tokens, role_x_bias))
-        
-        # Format as problem-solving dialogue
-        return self._format_problem_solving_conversation(conversation, problem_solving_mode)
-    
-    def _format_problem_solving_conversation(self, conversation: List[Tuple[str, str, List[str], float]], 
-                                              problem_solving_mode: bool) -> str:
-        """Format conversation turns into problem-solving dialogue with role indicators."""
+
+        role_avg_flow = {role: role_flow_sums[role] / role_flow_counts[role] if role_flow_counts[role] > 0 else 0.0 for role in role_token_counts.keys()}
+        metrics = GenerationMetrics(
+            role_token_counts=role_token_counts,
+            role_avg_flow=role_avg_flow,
+            keyword_usage=keyword_usage,
+            sentence_lengths=[s for s in sentence_lengths if s > 0],
+            question_count=question_count,
+            assertion_count=assertion_count,
+            avg_aesthetic_flow=sum(aesthetic_flows)/len(aesthetic_flows) if aesthetic_flows else 0.0,
+            total_tokens=total_steps
+        )
+        text = self.format_conversation(conversation, problem_solving_mode)
+        return text, metrics
+
+    def format_conversation(self, conversation: List[Tuple[str, str, List[str], float]], problem_solving_mode: bool) -> str:
         lines = []
-        
         if problem_solving_mode:
             lines.append("=" * 60)
-            lines.append("MULTI-ENTITY PROBLEM SOLVING SESSION")
+            lines.append("SINGLE-ENTITY PROBLEM SOLVING SESSION")
             lines.append("=" * 60)
             lines.append("")
-        
         for role, mode, tokens, x_bias in conversation:
             text = detokenize(tokens)
             if text.strip():
                 if problem_solving_mode:
-                    # Add role indicator with mode and flow position
                     lines.append(f"[{role.upper()}] ({mode}, flow: {x_bias:.2f})")
                     lines.append(f"{text}")
                     lines.append("")
                 else:
                     lines.append(f"{role}: {text}")
                     lines.append("")
-        
         if problem_solving_mode:
             lines.append("=" * 60)
             lines.append("END OF SESSION")
             lines.append("=" * 60)
-        
         return "\n".join(lines)
 
 
 # ----------------------------
-# GRADIO UI
+# RUN & UI
 # ----------------------------
 
-def _load_corpus(use_hf: bool, hf_dataset: str, hf_split: str, hf_max_rows: int, infile) -> str:
+def _resolve_gradio_file_to_path(infile) -> str:
+    if infile is None: raise ValueError("No input file provided.")
+    if isinstance(infile, str): return infile
+    if hasattr(infile, "name") and isinstance(infile.name, str): return infile.name
+    if isinstance(infile, dict) and "path" in infile: return str(infile["path"])
+    if hasattr(infile, "path"): return str(infile.path)
+    raise ValueError(f"Unsupported infile type: {type(infile)}")
+
+def _load_corpus(use_hf: bool, hf_dataset: str, hf_split: str, hf_max_rows: int, text_file) -> str:
     if use_hf:
         ds = load_dataset(hf_dataset, split=hf_split)
         rows = int(hf_max_rows) if int(hf_max_rows) > 0 else len(ds)
@@ -1231,133 +1063,96 @@ def _load_corpus(use_hf: bool, hf_dataset: str, hf_split: str, hf_max_rows: int,
             return "\n".join(str(x) for x in ds.select(range(rows))["text"])
         return "\n".join(str(ds[i]) for i in range(rows))
     else:
-        return load_text(_resolve_gradio_file_to_path(infile))
+        if text_file is None: raise ValueError("No text file provided.")
+        path = _resolve_gradio_file_to_path(text_file)
+        return load_text(path)
 
-def run_generate(infile, use_hf, hf_dataset, hf_split, hf_max_rows,
-                 prompt, seed, x_start, max_tokens, num_speakers, tokens_per_turn,
-                 problem_solving_mode, steer, focus, pairwise, oscs, boot_epochs,
-                 progress=gr.Progress()):
+def run_session(use_hf, hf_dataset, hf_split, hf_max_rows, text_file, 
+                prompt, seed, maxtokens, num_speakers, 
+                steer, focus, pairwise, progress=gr.Progress()):
     try:
-        corpus_text = _load_corpus(bool(use_hf), str(hf_dataset), str(hf_split), int(hf_max_rows), infile)
+        progress(0.0, desc="Loading corpus...")
+        corpus_text = _load_corpus(bool(use_hf), str(hf_dataset), str(hf_split), int(hf_max_rows), text_file)
+        
+        gen = NeuroSymbolicGraphGenerator(
+            steer_strength=float(steer), focus_strength=float(focus), 
+            pairwise_strength=float(pairwise), activator_boot_epochs=15, hemi_enable=True
+        )
+        
+        progress(0.2, desc="Preparing corpus...")
+        prep = gen.prepare_corpus(corpus_text, progress=progress)
+        
+        progress(0.5, desc="Generating Session...")
+        text, metrics = gen.generate(
+            prep, str(prompt), start_x=0.0, max_tokens=int(maxtokens), 
+            seed=int(seed), num_speakers=int(num_speakers), tokens_per_turn=60
+        )
+        
+        # Simple Stats String
+        stats = []
+        stats.append(f"Total Tokens: {metrics.total_tokens}")
+        stats.append(f"Average Flow: {metrics.avg_aesthetic_flow:.3f}")
+        stats.append(f"Questions: {metrics.question_count}, Assertions: {metrics.assertion_count}")
+        stats.append("Role Breakdown:")
+        for r, c in metrics.role_token_counts.items():
+            stats.append(f"  - {r}: {c} tokens")
+        
+        return text, "\n".join(stats)
+
     except Exception as e:
-        return f"Corpus load error: {e}"
+        import traceback
+        traceback.print_exc()
+        return f"Error: {str(e)}", ""
 
-    gen = NeuroSymbolicGraphGenerator(
-        steer_strength=float(steer),
-        focus_strength=float(focus),
-        pairwise_strength=float(pairwise),
-        osculator_strength=float(oscs),
-        activator_boot_epochs=int(boot_epochs),
-
-        # Hemicontinuity knobs (you can surface these in the UI if you want)
-        hemi_enable=True,
-        hemi_top_k=64,
-        hemi_strength=0.15,
-        hemi_smooth_alpha=0.05,
+def toggle_corpus_source(use_hf_val):
+    return (
+        gr.update(visible=use_hf_val), # hf_dataset
+        gr.update(visible=use_hf_val), # hf_split
+        gr.update(visible=use_hf_val), # hf_max_rows
+        gr.update(visible=not use_hf_val), # text_file
+        gr.update(visible=not use_hf_val), # file_info
     )
-    prep = gen.prepare_corpus(corpus_text, progress=progress)
-
-    mode_str = "PROBLEM-SOLVING" if problem_solving_mode else "CONVERSATIONAL"
-    header = (
-        f"[{mode_str} GENERATION]\n"
-        f"Tokens: {len(prep.tokens)}\n"
-        f"Speakers: {num_speakers}\n"
-        f"Tokens per turn: ~{tokens_per_turn}\n"
-        f"Aesthetic flow (graph): {prep.state.semantic_graph.get_aesthetic_flow():.3f}\n"
-        f"Activator global_mean4: {prep.state.activator.global_mean4.detach().cpu().numpy()}\n"
-        f"{'-'*60}\n\n"
-    )
-    txt = gen.generate(prep, prompt=str(prompt), start_x=float(x_start), max_tokens=int(max_tokens), 
-                      seed=int(seed), num_speakers=int(num_speakers), tokens_per_turn=int(tokens_per_turn),
-                      problem_solving_mode=bool(problem_solving_mode))
-    return header + txt
 
 def build_app():
-    with gr.Blocks(title="NeuroSymbolic V6.1 - Problem Solving") as demo:
-        gr.Markdown(
-            "# NeuroSymbolic V6.1: Multi-Entity Problem Solving\n"
-            "**Multi-Entity Problem Solving**: Specialized roles collaborate to analyze and solve problems.\n\n"
-            "**Roles in Problem-Solving Mode:**\n"
-            "- **Problem Poser** (flow: 0.0-0.25): Frames questions and identifies challenges\n"
-            "- **Analyzer** (flow: 0.2-0.45): Examines details and breaks down components\n"
-            "- **Solution Proposer** (flow: 0.4-0.7): Suggests approaches and methods\n"
-            "- **Critic** (flow: 0.5-0.75): Identifies issues and challenges proposals\n"
-            "- **Synthesizer** (flow: 0.7-1.0): Integrates insights and draws conclusions\n\n"
-            "Each role operates at different positions in the problem→solution flow space, creating a natural progression through the problem-solving process."
-        )
-
+    with gr.Blocks(title="NeuroSymbolic Generator") as demo:
+        gr.Markdown("# NeuroSymbolic V6.5 - Single Session Generator")
+        
         with gr.Row():
             with gr.Column(scale=1):
-                gr.Markdown("### Corpus Settings")
+                gr.Markdown("### Corpus")
                 use_hf = gr.Checkbox(label="Use Hugging Face dataset", value=True)
-                hf_dataset = gr.Textbox(label="HF dataset name", value="AiresPucrs/stanford-encyclopedia-philosophy")
-                hf_split = gr.Textbox(label="HF split", value="train")
-                hf_max_rows = gr.Slider(0, 20000, value=2000, step=100, label="HF max rows (0=all)")
-                infile = gr.File(label="Input File (txt/md) if not using HF", file_types=[".txt", ".md"])
-
-                gr.Markdown("### Neural Parameters")
-                steer = gr.Slider(0, 5, value=1.35, step=0.05, label="Base steer")
-                focus = gr.Slider(0, 1, value=0.5, step=0.01, label="Focus strength")
-                pairwise = gr.Slider(0, 2, value=0.4, step=0.05, label="Pairwise strength")
-                oscs = gr.Slider(0, 1, value=0.1, step=0.05, label="Osculator strength")
-                boot_epochs = gr.Slider(0, 80, value=25, step=5, label="Activator bootstrap epochs")
+                hf_dataset = gr.Textbox(label="HF Dataset", value="AiresPucrs/stanford-encyclopedia-philosophy", visible=True)
+                hf_split = gr.Textbox(label="Split", value="train", visible=True)
+                hf_max_rows = gr.Slider(100, 5000, value=2000, step=100, label="Max rows", visible=True)
+                text_file = gr.File(label="Upload Text File", file_types=[".txt", ".md"], visible=False)
+                file_info = gr.Markdown("Using entire file as corpus.", visible=False)
+                
+                use_hf.change(toggle_corpus_source, inputs=[use_hf], outputs=[hf_dataset, hf_split, hf_max_rows, text_file, file_info])
+                
+                gr.Markdown("### Parameters")
+                seed = gr.Number(value=42, label="Seed")
+                maxtokens = gr.Slider(100, 1000, value=300, step=50, label="Tokens")
+                num_speakers = gr.Slider(2, 5, value=5, step=1, label="Roles")
+                steer = gr.Slider(0.5, 3, value=1.35, step=0.05, label="Steer strength")
+                focus = gr.Slider(0, 1, value=0.5, step=0.05, label="Focus strength")
+                pairwise = gr.Slider(0, 2, value=0.6, step=0.1, label="Pairwise strength")
 
             with gr.Column(scale=2):
-                tabs = gr.Tabs()
+                prompt = gr.Textbox(label="Prompt", value="What is the nature of consciousness?", lines=2)
+                btn = gr.Button("Generate", variant="primary", size="lg")
+                
+                output_text = gr.Textbox(label="Session Output", lines=25)
+                output_stats = gr.Textbox(label="Session Stats", lines=8)
 
-                with gr.TabItem("Problem Solving"):
-                    gr.Markdown("### Generation Settings")
-                    
-                    problem_solving_mode = gr.Checkbox(
-                        label="Enable Problem-Solving Mode", 
-                        value=True,
-                        info="Use specialized roles (Problem Poser, Analyzer, etc.) vs generic speakers"
-                    )
-                    
-                    prompt = gr.Textbox(
-                        label="Problem or Question", 
-                        value="What is the nature of consciousness?", 
-                        lines=3,
-                        info="Frame as a question or problem statement for best results"
-                    )
-                    
-                    with gr.Row():
-                        seed = gr.Number(value=42, label="Seed")
-                        x_start = gr.Slider(0, 1, value=0.0, step=0.01, label="Start Position (x)", 
-                                          info="0.0 starts at problem space")
+        btn.click(
+            run_session,
+            inputs=[use_hf, hf_dataset, hf_split, hf_max_rows, text_file, 
+                    prompt, seed, maxtokens, num_speakers, steer, focus, pairwise],
+            outputs=[output_text, output_stats]
+        )
 
-                    with gr.Row():
-                        max_tokens = gr.Slider(10, 1000, value=400, step=10, 
-                                             label="Max Tokens (total across all roles)")
-                        num_speakers = gr.Slider(2, 5, value=5, step=1, 
-                                               label="Number of Entities",
-                                               info="Cycles through roles if > 5")
-                    
-                    tokens_per_turn = gr.Slider(20, 150, value=60, step=5, 
-                                              label="Tokens per Turn (approx)",
-                                              info="Length of each entity's contribution")
-
-                    out_txt = gr.Textbox(label="Problem-Solving Dialogue", lines=25)
-                    
-                    btn = gr.Button("Generate Problem-Solving Session", variant="primary", size="lg")
-                    btn.click(
-                        run_generate,
-                        inputs=[infile, use_hf, hf_dataset, hf_split, hf_max_rows,
-                                prompt, seed, x_start, max_tokens, num_speakers, tokens_per_turn,
-                                problem_solving_mode, steer, focus, pairwise, oscs, boot_epochs],
-                        outputs=out_txt
-                    )
-                    
-                    gr.Markdown(
-                        "### Tips for Best Results:\n"
-                        "- Frame prompts as questions or problems\n"
-                        "- Use 5 speakers to get all specialized roles\n"
-                        "- Start at x=0.0 to begin in problem space\n"
-                        "- Increase max tokens (400-600) for deeper analysis\n"
-                        "- Higher pairwise strength (0.6-0.8) encourages role-specific vocabulary"
-                    )
-
-        return demo
+    return demo
 
 if __name__ == "__main__":
-    build_app().queue().launch()
+    demo = build_app()
+    demo.queue().launch(share=False)

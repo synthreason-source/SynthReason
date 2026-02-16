@@ -2,12 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-NeuroSymbolic V6.5 - Professional Narrative Generation
-Features:
-- Sophisticated narrative generation with natural flow
-- Progressive voice perspectives (Observer, Questioner, Connector, etc.)
-- Balanced vocabulary: accessible yet refined
-- Conceptual depth without excessive abstraction
+NeuroSymbolic V7.0 - Professional Narrative Generation WITH CENTROID OF MEANING
+New Features:
+- Semantic centroid computed for each token in vocabulary
+- Centroid-aware generation: tokens near current centroid are boosted
+- Coherence tracking: measures semantic tightness
+- Multi-scale semantics: local (pairwise) + global (centroid)
 """
 
 from __future__ import annotations
@@ -26,6 +26,156 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from datasets import load_dataset
+
+
+# ----------------------------
+# CENTROID OF MEANING SYSTEM
+# ----------------------------
+
+@dataclass
+class SemanticCentroid:
+    """Represents the centroid of meaning for a token in aesthetic space"""
+    token: str
+    centroid_vector: np.ndarray  # 4D: [harmony, density, momentum, resonance]
+    neighbor_tokens: List[str]
+    coherence: float  # How tightly clustered (0-1)
+    
+    def distance_to(self, other: "SemanticCentroid") -> float:
+        return float(np.linalg.norm(self.centroid_vector - other.centroid_vector))
+    
+    def similarity_to(self, other: "SemanticCentroid") -> float:
+        """Exponential decay: closer centroids = higher similarity"""
+        return math.exp(-self.distance_to(other))
+
+
+class CentroidComputer:
+    """Computes and manages semantic centroids for tokens"""
+    
+    def __init__(self, max_neighbors: int = 50):
+        self.max_neighbors = max_neighbors
+        self.centroids: Dict[str, SemanticCentroid] = {}
+    
+    def compute_centroid(self, token: str, vocabulary: List[str], 
+                        freq_dict: Optional[Dict[str, int]] = None) -> SemanticCentroid:
+        """
+        Compute semantic centroid for a token based on pairwise relationships.
+        
+        Process:
+        1. Create SymbolicPair with each vocab token
+        2. Extract 4D aesthetic vectors
+        3. Weight by token frequency
+        4. Take top-k most harmonious neighbors
+        5. Compute mean position = centroid
+        6. Measure coherence (cluster tightness)
+        """
+        from __main__ import SymbolicPair  # Import from current module
+        
+        pairs = []
+        for other_token in vocabulary:
+            if other_token == token:
+                continue
+            
+            pair = SymbolicPair.from_tokens(token, other_token)
+            aesthetic_vec = pair.aesthetic_vector()
+            
+            # Weight by frequency
+            weight = 1.0
+            if freq_dict is not None:
+                freq = freq_dict.get(other_token, 1)
+                weight = math.log(1 + freq)
+            
+            pairs.append((pair, weight, other_token, aesthetic_vec))
+        
+        # Sort by harmony (most similar first)
+        pairs.sort(key=lambda x: x[0].harmony, reverse=True)
+        
+        # Take top N neighbors
+        top_pairs = pairs[:self.max_neighbors]
+        neighbor_tokens = [tok for (_, _, tok, _) in top_pairs]
+        weighted_vectors = [vec * weight for (_, weight, _, vec) in top_pairs]
+        
+        # Compute centroid
+        if len(weighted_vectors) > 0:
+            vectors_array = np.stack(weighted_vectors)
+            centroid_vec = np.mean(vectors_array, axis=0)
+            
+            # Coherence = inverse of neighbor spread
+            distances = [np.linalg.norm(v - centroid_vec) for v in weighted_vectors]
+            coherence = 1.0 - (np.mean(distances) / (np.max(distances) + 1e-12))
+            coherence = float(np.clip(coherence, 0.0, 1.0))
+        else:
+            centroid_vec = np.zeros(4, dtype=np.float32)
+            coherence = 0.0
+        
+        centroid = SemanticCentroid(
+            token=token,
+            centroid_vector=centroid_vec,
+            neighbor_tokens=neighbor_tokens,
+            coherence=coherence
+        )
+        
+        self.centroids[token] = centroid
+        return centroid
+    
+    def compute_all_centroids(self, tokens: List[str], 
+                             freq_dict: Optional[Dict[str, int]] = None,
+                             progress=None) -> Dict[str, SemanticCentroid]:
+        """Compute centroids for all unique tokens"""
+        unique_tokens = list(set(tokens))
+        
+        if progress:
+            progress(0.15, desc=f"Computing centroids for {len(unique_tokens)} tokens...")
+        
+        for i, token in enumerate(unique_tokens):
+            self.compute_centroid(token, unique_tokens, freq_dict=freq_dict)
+            
+            if progress and i % 100 == 0 and i > 0:
+                pct = 0.15 + 0.05 * (i / len(unique_tokens))
+                progress(pct, desc=f"Centroids: {i}/{len(unique_tokens)}")
+        
+        return self.centroids
+    
+    def get_centroid_boost(self, current_token: str, candidate_tokens: List[str],
+                          boost_strength: float = 0.3) -> np.ndarray:
+        """
+        Compute centroid-based boost for candidate tokens.
+        Tokens with centroids near the current token's centroid get boosted.
+        
+        This creates "semantic gravity" that pulls generation toward
+        related concepts in the 4D aesthetic space.
+        """
+        if current_token not in self.centroids:
+            return np.zeros(len(candidate_tokens), dtype=np.float32)
+        
+        current_centroid = self.centroids[current_token]
+        boosts = []
+        
+        for candidate in candidate_tokens:
+            if candidate in self.centroids:
+                # Similarity decays exponentially with distance
+                similarity = current_centroid.similarity_to(self.centroids[candidate])
+                boost = boost_strength * similarity
+            else:
+                boost = 0.0
+            boosts.append(boost)
+        
+        return np.array(boosts, dtype=np.float32)
+    
+    def get_summary_stats(self) -> Dict[str, Any]:
+        """Get summary statistics about centroids"""
+        if not self.centroids:
+            return {}
+        
+        coherences = [c.coherence for c in self.centroids.values()]
+        return {
+            "total_centroids": len(self.centroids),
+            "avg_coherence": np.mean(coherences),
+            "min_coherence": np.min(coherences),
+            "max_coherence": np.max(coherences),
+            "high_coherence_tokens": [
+                t for t, c in self.centroids.items() if c.coherence > 0.7
+            ][:10]
+        }
 
 
 # ----------------------------
@@ -721,6 +871,7 @@ class ModelState:
     lm: QuadgramLM
     activator: NeuronalActivator
     problem_flow_by_token: Dict[str, float]
+    centroid_computer: CentroidComputer  # NEW: Added centroid system
 
 @dataclass
 class PreparedCorpus:
@@ -762,6 +913,7 @@ class GenerationMetrics:
     abstract_density: float = 0.0
     conceptual_jumps: int = 0
     unique_combinations: int = 0
+    centroid_stats: Dict[str, Any] = None  # NEW: Centroid statistics
 
 
 # ----------------------------
@@ -783,7 +935,8 @@ class NeuroSymbolicGraphGenerator:
                  hemi_enable: bool = True,
                  hemi_top_k: int = 64,
                  hemi_strength: float = 0.15,
-                 hemi_smooth_alpha: float = 0.05):
+                 hemi_smooth_alpha: float = 0.05,
+                 centroid_boost_strength: float = 0.35):  # NEW PARAMETER
         self.nodelets_n = int(nodelets_n)
         self.bars_n = int(bars_n)
         self.svd_random_state = int(svd_random_state)
@@ -804,6 +957,7 @@ class NeuroSymbolicGraphGenerator:
             penalty_strength=float(hemi_strength),
             smooth_alpha=float(hemi_smooth_alpha),
         )
+        self.centroid_boost_strength = float(centroid_boost_strength)  # NEW
 
     def _pick_initial_context(self, lm: QuadgramLM, seed_words: List[str]) -> Tuple[str, str, str]:
         sw = [t for t in seed_words if re.match(r"^[a-z][a-z0-9_'-]*$", t) and t not in COGNITIVE_TOKENS]
@@ -818,6 +972,16 @@ class NeuroSymbolicGraphGenerator:
         flow_by_token = compute_problem_flow_by_token(tokens)
         lm = QuadgramLM(add_k=self.lm_add_k)
         lm.ingest(tokens)
+        
+        # NEW: Compute semantic centroids for vocabulary
+        if progress:
+            progress(0.1, desc="Computing semantic centroids...")
+        centroid_computer = CentroidComputer(max_neighbors=50)
+        centroid_computer.compute_all_centroids(tokens, freq_dict=lm.uni, progress=progress)
+        
+        if progress:
+            progress(0.2, desc="Building token boosts...")
+        
         token_boost: Dict[str, float] = {}
         for tok, boost_val in COGNITIVE_TOKENS.items():
             token_boost[tok] = boost_val
@@ -870,6 +1034,7 @@ class NeuroSymbolicGraphGenerator:
             lm=lm,
             activator=activator,
             problem_flow_by_token=flow_by_token,
+            centroid_computer=centroid_computer,  # NEW
         )
 
     def prepare_corpus(self, raw_text: str, progress=None) -> PreparedCorpus:
@@ -964,9 +1129,19 @@ class NeuroSymbolicGraphGenerator:
         x_pos = x_pos.to(device=device, dtype=torch.float32).clamp(0.0, 1.0)
         boosts = torch.tensor([prep.state.token_boost.get(w, 0.0) for w in cand], dtype=torch.float32, device=device)
 
+        # Pairwise activator boost
         w_pair, _vec4 = prep.state.activator.forward_weight(w3, cand, x_pos=x_pos)
         w_pair = w_pair / (w_pair.mean() + 1e-12)
         boosts = boosts + self.pairwise_strength * w_pair
+
+        # NEW: CENTROID BOOST - Pull toward semantically related tokens
+        centroid_boost = prep.state.centroid_computer.get_centroid_boost(
+            current_token=w3,
+            candidate_tokens=cand,
+            boost_strength=self.centroid_boost_strength
+        )
+        centroid_boost_t = torch.tensor(centroid_boost, dtype=torch.float32, device=device)
+        boosts = boosts + centroid_boost_t  # Add centroid semantic gravity
 
         # NARRATIVE MODE MODIFICATIONS
         if abstract_coinage_mode:
@@ -1168,6 +1343,9 @@ class NeuroSymbolicGraphGenerator:
             all_tokens.extend(tokens)
         abstract_density = sum(len(t) for t in all_tokens if re.match(r"[A-Za-z]", t)) / max(1, len(all_tokens))
         
+        # Get centroid statistics
+        centroid_stats = prep.state.centroid_computer.get_summary_stats()
+        
         metrics = GenerationMetrics(
             role_token_counts=role_token_counts,
             role_avg_flow=role_avg_flow,
@@ -1179,7 +1357,8 @@ class NeuroSymbolicGraphGenerator:
             total_tokens=total_steps,
             abstract_density=abstract_density,
             conceptual_jumps=conceptual_jumps,
-            unique_combinations=len(unique_pairs)
+            unique_combinations=len(unique_pairs),
+            centroid_stats=centroid_stats  # NEW
         )
         
         text = self.format_conversation(conversation, problem_solving_mode, abstract_coinage_mode)
@@ -1251,7 +1430,8 @@ def _load_corpus(use_hf: bool, hf_dataset: str, hf_split: str, hf_max_rows: int,
 
 def run_session(use_hf, hf_dataset, hf_split, hf_max_rows, text_file, 
                 prompt, seed, maxtokens, num_speakers, 
-                steer, focus, pairwise, abstract_mode, creativity, progress=gr.Progress()):
+                steer, focus, pairwise, abstract_mode, creativity, centroid_strength, 
+                progress=gr.Progress()):
     try:
         progress(0.0, desc="Loading corpus...")
         corpus_text = _load_corpus(bool(use_hf), str(hf_dataset), str(hf_split), int(hf_max_rows), text_file)
@@ -1259,10 +1439,11 @@ def run_session(use_hf, hf_dataset, hf_split, hf_max_rows, text_file,
         gen = NeuroSymbolicGraphGenerator(
             steer_strength=float(steer), focus_strength=float(focus), 
             pairwise_strength=float(pairwise), activator_boot_epochs=15, 
-            hemi_enable=not abstract_mode  # Disable hemi for abstract mode
+            hemi_enable=not abstract_mode,  # Disable hemi for abstract mode
+            centroid_boost_strength=float(centroid_strength)  # NEW PARAMETER
         )
         
-        progress(0.2, desc="Preparing corpus...")
+        progress(0.05, desc="Preparing corpus...")
         prep = gen.prepare_corpus(corpus_text, progress=progress)
         
         progress(0.5, desc="Generating Session...")
@@ -1285,6 +1466,16 @@ def run_session(use_hf, hf_dataset, hf_split, hf_max_rows, text_file,
             stats.append(f"Unique Combinations: {metrics.unique_combinations}")
         else:
             stats.append(f"Questions: {metrics.question_count}, Assertions: {metrics.assertion_count}")
+        
+        # NEW: Centroid statistics
+        if metrics.centroid_stats:
+            stats.append(f"\nCentroid Statistics:")
+            stats.append(f"  Total centroids: {metrics.centroid_stats.get('total_centroids', 0)}")
+            stats.append(f"  Avg coherence: {metrics.centroid_stats.get('avg_coherence', 0):.3f}")
+            stats.append(f"  Coherence range: [{metrics.centroid_stats.get('min_coherence', 0):.3f}, {metrics.centroid_stats.get('max_coherence', 0):.3f}]")
+            high_coh = metrics.centroid_stats.get('high_coherence_tokens', [])
+            if high_coh:
+                stats.append(f"  High coherence tokens: {', '.join(high_coh[:5])}")
         
         stats.append("\nRole Breakdown:")
         for r, c in metrics.role_token_counts.items():
@@ -1317,10 +1508,12 @@ def toggle_mode(abstract_val):
     return gr.update(visible=abstract_val)
 
 def build_app():
-    with gr.Blocks(title="NeuroSymbolic Narrative Generator", theme=gr.themes.Soft()) as demo:
+    with gr.Blocks(title="NeuroSymbolic V7.0 - Centroid of Meaning", theme=gr.themes.Soft()) as demo:
         gr.Markdown("""
-        # NeuroSymbolic V6.5 - Narrative Generation
-        Generate flowing narratives with sophisticated language and conceptual depth
+        # NeuroSymbolic V7.0 - Narrative Generation
+        Generate flowing narratives with sophisticated language and **semantic coherence**
+        
+        **NEW**: Each token has a computed semantic centroid that guides generation toward related concepts!
         """)
         
         with gr.Row():
@@ -1352,6 +1545,8 @@ def build_app():
                     steer = gr.Slider(0.5, 3, value=1.35, step=0.05, label="Steer strength")
                     focus = gr.Slider(0, 1, value=0.5, step=0.05, label="Focus strength")
                     pairwise = gr.Slider(0, 2, value=0.6, step=0.1, label="Pairwise strength")
+                    centroid_strength = gr.Slider(0, 1, value=0.35, step=0.05, label="Centroid boost strength",
+                                                 info="NEW: Semantic gravity toward related concepts")
 
             with gr.Column(scale=2):
                 prompt = gr.Textbox(
@@ -1363,26 +1558,35 @@ def build_app():
                 btn = gr.Button("Generate Narrative", variant="primary", size="lg")
                 
                 output_text = gr.Textbox(label="Generated Narrative", lines=25, show_copy_button=True)
-                output_stats = gr.Textbox(label="Generation Statistics", lines=10)
+                output_stats = gr.Textbox(label="Generation Statistics", lines=15)
 
         btn.click(
             run_session,
             inputs=[use_hf, hf_dataset, hf_split, hf_max_rows, text_file, 
                     prompt, seed, maxtokens, num_speakers, steer, focus, pairwise,
-                    abstract_mode, creativity],
+                    abstract_mode, creativity, centroid_strength],
             outputs=[output_text, output_stats]
         )
         
         gr.Markdown("""
-        ### About Narrative Mode
+        ### About Centroid of Meaning
         
-        This mode generates sophisticated narratives by:
-        - **Using natural but refined vocabulary** with appropriate complexity
-        - **Building ideas progressively** through different narrative voices
-        - **Maintaining conceptual coherence** while introducing novel connections
-        - **Balancing accessibility with depth** in language and structure
+        **NEW in V7.0**: Each token has a **semantic centroid** computed in 4D aesthetic space:
+        - **Harmony**: string similarity (edit distance)
+        - **Density**: combined token lengths
+        - **Momentum**: relative length change
+        - **Resonance**: hash-based variation
         
-        Adjust **Creative Language** to control vocabulary sophistication and phrasing novelty.
+        During generation, tokens near the current token's centroid are **boosted**, creating:
+        - **Semantic coherence**: Maintains conceptual flow
+        - **Multi-scale semantics**: Local (pairwise) + global (centroid) relationships
+        - **Adaptive generation**: High-coherence tokens have stable centroids, low-coherence spread out
+        
+        Adjust **Centroid boost strength** to control:
+        - **High (0.5-0.8)**: Stay near current concept (tight semantic flow)
+        - **Medium (0.3-0.4)**: Balance coherence with exploration
+        - **Low (0.1-0.2)**: Allow more conceptual jumps
+        - **Zero**: Disable for maximum creativity
         """)
 
     return demo

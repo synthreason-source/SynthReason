@@ -49,87 +49,113 @@ class SemanticCentroid:
 
 
 class CentroidComputer:
-    """Computes and manages semantic centroids for tokens"""
+    """Computes and manages semantic centroids for tokens - OPTIMIZED VERSION"""
     
-    def __init__(self, max_neighbors: int = 50):
+    def __init__(self, max_neighbors: int = 30, max_vocab_size: int = 1000):
         self.max_neighbors = max_neighbors
+        self.max_vocab_size = max_vocab_size  # Limit vocab for speed
         self.centroids: Dict[str, SemanticCentroid] = {}
     
-    def compute_centroid(self, token: str, vocabulary: List[str], 
-                        freq_dict: Optional[Dict[str, int]] = None) -> SemanticCentroid:
+    def compute_centroid_fast(self, token: str, vocabulary: List[str], 
+                             freq_dict: Optional[Dict[str, int]] = None) -> SemanticCentroid:
         """
-        Compute semantic centroid for a token based on pairwise relationships.
-        
-        Process:
-        1. Create SymbolicPair with each vocab token
-        2. Extract 4D aesthetic vectors
-        3. Weight by token frequency
-        4. Take top-k most harmonious neighbors
-        5. Compute mean position = centroid
-        6. Measure coherence (cluster tightness)
+        FAST centroid computation with optimizations:
+        - Only compute for top vocab by frequency
+        - Batch vector operations
+        - Early stopping for low-harmony pairs
         """
-        from __main__ import SymbolicPair  # Import from current module
+        from __main__ import SymbolicPair
         
-        pairs = []
-        for other_token in vocabulary:
+        # Quick approximation: only use top harmonious neighbors
+        top_neighbors = []
+        
+        for other_token in vocabulary[:min(200, len(vocabulary))]:  # Sample for speed
             if other_token == token:
                 continue
             
-            pair = SymbolicPair.from_tokens(token, other_token)
-            aesthetic_vec = pair.aesthetic_vector()
+            # Quick harmony check (edit distance is expensive)
+            if len(token) > 0 and len(other_token) > 0:
+                # Fast pre-filter: large length difference = low harmony
+                if abs(len(token) - len(other_token)) > min(len(token), len(other_token)):
+                    continue
             
-            # Weight by frequency
+            pair = SymbolicPair.from_tokens(token, other_token)
+            
+            # Early stopping: skip very low harmony pairs
+            if pair.harmony < 0.1:
+                continue
+            
+            aesthetic_vec = pair.aesthetic_vector()
             weight = 1.0
             if freq_dict is not None:
                 freq = freq_dict.get(other_token, 1)
                 weight = math.log(1 + freq)
             
-            pairs.append((pair, weight, other_token, aesthetic_vec))
+            top_neighbors.append((pair.harmony, weight, other_token, aesthetic_vec))
         
-        # Sort by harmony (most similar first)
-        pairs.sort(key=lambda x: x[0].harmony, reverse=True)
+        # Sort by harmony and take top N
+        top_neighbors.sort(key=lambda x: x[0], reverse=True)
+        top_neighbors = top_neighbors[:self.max_neighbors]
         
-        # Take top N neighbors
-        top_pairs = pairs[:self.max_neighbors]
-        neighbor_tokens = [tok for (_, _, tok, _) in top_pairs]
-        weighted_vectors = [vec * weight for (_, weight, _, vec) in top_pairs]
+        if not top_neighbors:
+            # No neighbors found, return default centroid
+            return SemanticCentroid(
+                token=token,
+                centroid_vector=np.zeros(4, dtype=np.float32),
+                neighbor_tokens=[],
+                coherence=0.0
+            )
         
-        # Compute centroid
-        if len(weighted_vectors) > 0:
-            vectors_array = np.stack(weighted_vectors)
-            centroid_vec = np.mean(vectors_array, axis=0)
-            
-            # Coherence = inverse of neighbor spread
-            distances = [np.linalg.norm(v - centroid_vec) for v in weighted_vectors]
-            coherence = 1.0 - (np.mean(distances) / (np.max(distances) + 1e-12))
-            coherence = float(np.clip(coherence, 0.0, 1.0))
-        else:
-            centroid_vec = np.zeros(4, dtype=np.float32)
-            coherence = 0.0
+        neighbor_tokens = [tok for (_, _, tok, _) in top_neighbors]
+        weighted_vectors = [vec * weight for (_, weight, _, vec) in top_neighbors]
         
-        centroid = SemanticCentroid(
+        # Batch compute centroid
+        vectors_array = np.stack(weighted_vectors)
+        centroid_vec = np.mean(vectors_array, axis=0)
+        
+        # Fast coherence estimate
+        distances = np.linalg.norm(vectors_array - centroid_vec, axis=1)
+        coherence = 1.0 - (np.mean(distances) / (np.max(distances) + 1e-12))
+        coherence = float(np.clip(coherence, 0.0, 1.0))
+        
+        return SemanticCentroid(
             token=token,
             centroid_vector=centroid_vec,
             neighbor_tokens=neighbor_tokens,
             coherence=coherence
         )
-        
-        self.centroids[token] = centroid
-        return centroid
     
     def compute_all_centroids(self, tokens: List[str], 
                              freq_dict: Optional[Dict[str, int]] = None,
                              progress=None) -> Dict[str, SemanticCentroid]:
-        """Compute centroids for all unique tokens"""
+        """Compute centroids for all unique tokens - OPTIMIZED"""
         unique_tokens = list(set(tokens))
         
-        if progress:
-            progress(0.15, desc=f"Computing centroids for {len(unique_tokens)} tokens...")
-        
-        for i, token in enumerate(unique_tokens):
-            self.compute_centroid(token, unique_tokens, freq_dict=freq_dict)
+        # OPTIMIZATION 1: Only compute for most frequent tokens
+        if freq_dict and len(unique_tokens) > self.max_vocab_size:
+            # Sort by frequency and take top tokens
+            sorted_tokens = sorted(unique_tokens, 
+                                  key=lambda t: freq_dict.get(t, 0), 
+                                  reverse=True)
+            unique_tokens = sorted_tokens[:self.max_vocab_size]
             
-            if progress and i % 100 == 0 and i > 0:
+            if progress:
+                progress(0.15, desc=f"Computing centroids for top {len(unique_tokens)} tokens...")
+        else:
+            if progress:
+                progress(0.15, desc=f"Computing centroids for {len(unique_tokens)} tokens...")
+        
+        # OPTIMIZATION 2: Batch progress updates
+        batch_size = 50
+        for i in range(0, len(unique_tokens), batch_size):
+            batch = unique_tokens[i:i+batch_size]
+            
+            for token in batch:
+                self.centroids[token] = self.compute_centroid_fast(
+                    token, unique_tokens, freq_dict=freq_dict
+                )
+            
+            if progress:
                 pct = 0.15 + 0.05 * (i / len(unique_tokens))
                 progress(pct, desc=f"Centroids: {i}/{len(unique_tokens)}")
         
@@ -936,7 +962,8 @@ class NeuroSymbolicGraphGenerator:
                  hemi_top_k: int = 64,
                  hemi_strength: float = 0.15,
                  hemi_smooth_alpha: float = 0.05,
-                 centroid_boost_strength: float = 0.35):  # NEW PARAMETER
+                 centroid_boost_strength: float = 0.35,
+                 centroid_enable: bool = True):  # NEW: Can disable
         self.nodelets_n = int(nodelets_n)
         self.bars_n = int(bars_n)
         self.svd_random_state = int(svd_random_state)
@@ -957,7 +984,8 @@ class NeuroSymbolicGraphGenerator:
             penalty_strength=float(hemi_strength),
             smooth_alpha=float(hemi_smooth_alpha),
         )
-        self.centroid_boost_strength = float(centroid_boost_strength)  # NEW
+        self.centroid_boost_strength = float(centroid_boost_strength)
+        self.centroid_enable = bool(centroid_enable)  # NEW
 
     def _pick_initial_context(self, lm: QuadgramLM, seed_words: List[str]) -> Tuple[str, str, str]:
         sw = [t for t in seed_words if re.match(r"^[a-z][a-z0-9_'-]*$", t) and t not in COGNITIVE_TOKENS]
@@ -973,10 +1001,10 @@ class NeuroSymbolicGraphGenerator:
         lm = QuadgramLM(add_k=self.lm_add_k)
         lm.ingest(tokens)
         
-        # NEW: Compute semantic centroids for vocabulary
+        # NEW: Compute semantic centroids for vocabulary (OPTIMIZED)
         if progress:
             progress(0.1, desc="Computing semantic centroids...")
-        centroid_computer = CentroidComputer(max_neighbors=50)
+        centroid_computer = CentroidComputer(max_neighbors=30, max_vocab_size=1000)
         centroid_computer.compute_all_centroids(tokens, freq_dict=lm.uni, progress=progress)
         
         if progress:
@@ -1510,7 +1538,7 @@ def toggle_mode(abstract_val):
 def build_app():
     with gr.Blocks(title="NeuroSymbolic V7.0 - Centroid of Meaning", theme=gr.themes.Soft()) as demo:
         gr.Markdown("""
-        # NeuroSymbolic V7.0 - Narrative Generation
+        # NeuroSymbolic V7.0 - Narrative Generation WITH CENTROID OF MEANING
         Generate flowing narratives with sophisticated language and **semantic coherence**
         
         **NEW**: Each token has a computed semantic centroid that guides generation toward related concepts!
@@ -1522,7 +1550,7 @@ def build_app():
                 use_hf = gr.Checkbox(label="Use Hugging Face dataset", value=True)
                 hf_dataset = gr.Textbox(label="HF Dataset", value="AiresPucrs/stanford-encyclopedia-philosophy", visible=True)
                 hf_split = gr.Textbox(label="Split", value="train", visible=True)
-                hf_max_rows = gr.Slider(100, 5000, value=500, step=100, label="Max rows", visible=True)
+                hf_max_rows = gr.Slider(100, 5000, value=2000, step=100, label="Max rows", visible=True)
                 text_file = gr.File(label="Upload Text File", file_types=[".txt", ".md"], visible=False)
                 file_info = gr.Markdown("Using entire file as corpus.", visible=False)
                 

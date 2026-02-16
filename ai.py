@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-NeuroSymbolic V6.5 - Abstract Coinage Story Mode
+NeuroSymbolic V6.5 - Abstract coinage Mode
 Features:
 - Abstract narrative generation with creative token coinage
 - Conceptual blending and unusual semantic connections
@@ -1248,7 +1248,7 @@ def toggle_mode(abstract_val):
 def build_app():
     with gr.Blocks(title="NeuroSymbolic Abstract Generator", theme=gr.themes.Soft()) as demo:
         gr.Markdown("""
-        # NeuroSymbolic V6.5 - Abstract Coinage Story Mode
+        # NeuroSymbolic V6.5 - Abstract coinage Mode
         Generate abstract narratives with creative token coinage and conceptual flow
         """)
         

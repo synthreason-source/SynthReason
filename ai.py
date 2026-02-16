@@ -952,14 +952,14 @@ class NeuroSymbolicGraphGenerator:
         total_steps = int(max_tokens)
         
         if abstract_coinage_mode:
-            # Abstract narrative roles with flow-based positioning
+            # Professional narrative voices with natural flow
             role_definitions = [
-                ("Essence Weaver", 0.0, 0.2, "crystallizing", ["essence", "crystalline", "pure", "distilled"]),
-                ("Manifold Navigator", 0.15, 0.35, "traversing", ["manifold", "dimensional", "layered", "fold"]),
-                ("Liminal Observer", 0.3, 0.5, "witnessing", ["liminal", "threshold", "boundary", "between"]),
-                ("Recursive Architect", 0.45, 0.65, "constructing", ["recursive", "self", "iteration", "cycle"]),
-                ("Emergent Synthesizer", 0.6, 0.8, "integrating", ["emergent", "arising", "becoming", "synthesis"]),
-                ("Transcendent Voice", 0.75, 1.0, "ascending", ["transcendent", "beyond", "infinite", "eternal"]),
+                ("Observer", 0.0, 0.2, "noticing", ["observe", "notice", "perceive", "see", "consider"]),
+                ("Questioner", 0.15, 0.35, "inquiring", ["perhaps", "might", "could", "what", "whether"]),
+                ("Connector", 0.3, 0.5, "relating", ["between", "connects", "relates", "links", "bridges"]),
+                ("Elaborator", 0.45, 0.65, "developing", ["further", "moreover", "building", "develops", "extends"]),
+                ("Synthesizer", 0.6, 0.8, "integrating", ["together", "combines", "integrates", "unifies", "converges"]),
+                ("Reflector", 0.75, 1.0, "concluding", ["ultimately", "thus", "suggests", "reveals", "illuminates"]),
             ]
         else:
             # Original problem-solving roles

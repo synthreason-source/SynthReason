@@ -2,11 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-NeuroSymbolic V6.5 - Abstract coinage Mode
+NeuroSymbolic V6.5 - Professional Narrative Generation
 Features:
-- Abstract narrative generation with creative token coinage
-- Conceptual blending and unusual semantic connections
-- Flow-based storytelling with invented language patterns
+- Sophisticated narrative generation with natural flow
+- Progressive voice perspectives (Observer, Questioner, Connector, etc.)
+- Balanced vocabulary: accessible yet refined
+- Conceptual depth without excessive abstraction
 """
 
 from __future__ import annotations
@@ -224,18 +225,6 @@ STOP_WORDS = set(
     which who will with you your yours
     """.split()
 )
-
-# Abstract coinage narrative markers
-NARRATIVE_FLOW_MARKERS = {
-    "essence": 0.15,
-    "crystalline": 0.25,
-    "manifold": 0.35,
-    "liminal": 0.45,
-    "recursive": 0.55,
-    "emergent": 0.65,
-    "transcendent": 0.75,
-    "infinite": 0.85,
-}
 
 PROBLEM_PATTERNS = [
     r"(?:problem|issue|challenge|difficulty|question|dilemma|paradox|conundrum|puzzle|obstacle)[s]?\s*(?:of|in|with|for|to)?\s*(?:the\s+)?(?:\w+\s*){0,10}\?",
@@ -459,23 +448,75 @@ class FuzzyWeightController(nn.Module):
 
     def forward(self, entropy01: torch.Tensor, peak01: torch.Tensor,
                 boost01: torch.Tensor, aesthetic_flow01: torch.Tensor,
-                osculator_strength: float = 0.0) -> torch.Tensor:
+                osculator_strength: float = 0.0,
+                trigram_positions: Optional[Tuple[float, float, float]] = None) -> torch.Tensor:
         e = entropy01.clamp(0, 1)
         p = peak01.clamp(0, 1)
         b = boost01.clamp(0, 1)
         a = aesthetic_flow01.clamp(0, 1)
 
-        e_low  = mf_trap(e, 0.0, 0.0, 0.25, 0.45)
-        e_mid  = mf_tri(e, 0.25, 0.50, 0.75)
-        e_high = mf_trap(e, 0.55, 0.75, 1.0, 1.0)
-        p_low  = mf_trap(p, 0.0, 0.0, 0.20, 0.40)
-        p_mid  = mf_tri(p, 0.25, 0.50, 0.75)
-        p_high = mf_trap(p, 0.60, 0.80, 1.0, 1.0)
-        b_low  = mf_trap(b, 0.0, 0.0, 0.20, 0.45)
-        b_mid  = mf_tri(b, 0.25, 0.50, 0.75)
-        b_high = mf_trap(b, 0.55, 0.80, 1.0, 1.0)
-        a_high = mf_trap(a, 0.5, 0.7, 1.0, 1.0)
+        # Use trigram positions if provided, otherwise use default [0.0, 0.5, 1.0]
+        if trigram_positions is not None:
+            pos1, pos2, pos3 = trigram_positions
+        else:
+            pos1, pos2, pos3 = 0.0, 0.5, 1.0
+        
+        # Convert positions to tensors
+        pos1_t = torch.tensor(pos1, device=e.device, dtype=torch.float32)
+        pos2_t = torch.tensor(pos2, device=e.device, dtype=torch.float32)
+        pos3_t = torch.tensor(pos3, device=e.device, dtype=torch.float32)
 
+        # Position-indexed membership functions for entropy (e)
+        # e_low uses pos1 to shift boundaries
+        e_low  = mf_trap(e, 0.0 * (1.0 - pos1_t) + 0.1 * pos1_t, 
+                            0.0 * (1.0 - pos1_t) + 0.15 * pos1_t, 
+                            0.25 + 0.1 * pos1_t, 
+                            0.45 + 0.05 * pos1_t)
+        # e_mid uses pos2
+        e_mid  = mf_tri(e, 0.25 - 0.05 * pos2_t, 
+                           0.50, 
+                           0.75 + 0.05 * pos2_t)
+        # e_high uses pos3
+        e_high = mf_trap(e, 0.55 - 0.1 * pos3_t, 
+                            0.75 - 0.05 * pos3_t, 
+                            1.0, 
+                            1.0)
+        
+        # Position-indexed membership functions for peak (p)
+        p_low  = mf_trap(p, 0.0, 
+                            0.0, 
+                            0.20 + 0.1 * pos1_t, 
+                            0.40 + 0.05 * pos1_t)
+        p_mid  = mf_tri(p, 0.25 - 0.1 * pos2_t, 
+                           0.50, 
+                           0.75 + 0.1 * pos2_t)
+        p_high = mf_trap(p, 0.60 - 0.1 * pos3_t, 
+                            0.80 - 0.05 * pos3_t, 
+                            1.0, 
+                            1.0)
+        
+        # Position-indexed membership functions for boost (b)
+        b_low  = mf_trap(b, 0.0, 
+                            0.0, 
+                            0.20 + 0.15 * pos1_t, 
+                            0.45 + 0.1 * pos1_t)
+        b_mid  = mf_tri(b, 0.25 - 0.1 * pos2_t, 
+                           0.50 + 0.05 * pos2_t, 
+                           0.75 + 0.05 * pos2_t)
+        b_high = mf_trap(b, 0.55 - 0.15 * pos3_t, 
+                            0.80 - 0.1 * pos3_t, 
+                            1.0, 
+                            1.0)
+        
+        # Position-indexed membership for aesthetic flow (a)
+        # Uses average position of trigram
+        avg_pos = (pos1_t + pos2_t + pos3_t) / 3.0
+        a_high = mf_trap(a, 0.5 - 0.1 * avg_pos, 
+                            0.7 - 0.05 * avg_pos, 
+                            1.0, 
+                            1.0)
+
+        # Fuzzy rules (unchanged)
         w1 = tnorm_prod(e_high, p_low)
         w2 = tnorm_prod(e_mid, b_mid)
         w3 = snorm_max(p_high, b_high)
@@ -841,30 +882,61 @@ class NeuroSymbolicGraphGenerator:
 
     def _compute_abstract_coinage_boost(self, cand: List[str], w1: str, w2: str, w3: str, 
                                        prep: PreparedCorpus, creativity: float) -> torch.Tensor:
-        """Boost tokens based on abstract/novel combinations"""
+        """Boost tokens based on sophistication and natural novelty"""
         device = prep.state.activator.emb.weight.device
         boost = torch.zeros(len(cand), dtype=torch.float32, device=device)
         
-        # Favor longer, more complex words (abstract language)
+        # Moderate complexity boost for natural sophistication
         for i, word in enumerate(cand):
-            # Length boost
-            if len(word) >= 7:
-                boost[i] += 0.3 * creativity
-            elif len(word) >= 5:
-                boost[i] += 0.15 * creativity
+            # Favor moderately complex words (natural vocabulary)
+            if 5 <= len(word) <= 9:
+                boost[i] += 0.2 * creativity
+            elif len(word) >= 10:
+                boost[i] += 0.15 * creativity  # Don't over-favor extremely long words
             
-            # Rare word boost (inverse frequency)
+            # Modest rarity boost (prefer less common but not obscure)
             freq = prep.state.lm.uni.get(word, 0)
             if freq > 0 and prep.state.lm.total > 0:
-                rarity = 1.0 - (freq / prep.state.lm.total)
-                boost[i] += 0.4 * rarity * creativity
+                normalized_freq = freq / prep.state.lm.total
+                # Sweet spot: not too common, not too rare
+                if 0.0001 < normalized_freq < 0.01:
+                    rarity_score = 1.0 - (normalized_freq / 0.01)
+                    boost[i] += 0.25 * rarity_score * creativity
+                elif normalized_freq <= 0.0001:
+                    boost[i] += 0.15 * creativity  # Very rare words get moderate boost
             
-            # Semantic distance from context (novelty)
+            # Encourage natural semantic connections (moderate novelty)
             pair = SymbolicPair.from_tokens(w3, word)
-            if pair.harmony < 0.5:  # dissimilar = novel
-                boost[i] += 0.25 * (1.0 - pair.harmony) * creativity
+            # Sweet spot: related but not too similar
+            if 0.3 < pair.harmony < 0.7:
+                novelty = abs(pair.harmony - 0.5) / 0.2  # Peak at 0.5
+                boost[i] += 0.2 * (1.0 - novelty) * creativity
         
         return boost
+
+    def _compute_trigram_positions(self, w1: str, w2: str, w3: str, 
+                                   prep: PreparedCorpus) -> Tuple[float, float, float]:
+        """Compute normalized position indexes for trigram based on vocab frequency"""
+        vocab_size = len(prep.state.lm.vocab)
+        if vocab_size == 0:
+            return (0.0, 0.5, 1.0)
+        
+        # Get frequency ranks (lower rank = more common)
+        def get_position(word: str) -> float:
+            freq = prep.state.lm.uni.get(word, 0)
+            if freq == 0:
+                return 1.0  # Unknown words get highest position
+            # Sort all words by frequency to get rank
+            sorted_words = sorted(prep.state.lm.uni.items(), key=lambda x: -x[1])
+            rank = next((i for i, (w, _) in enumerate(sorted_words) if w == word), vocab_size)
+            # Normalize to [0, 1]
+            return rank / max(1, vocab_size)
+        
+        pos1 = get_position(w1)
+        pos2 = get_position(w2)
+        pos3 = get_position(w3)
+        
+        return (pos1, pos2, pos3)
 
     def _final_probs(self, prep: PreparedCorpus, w1: str, w2: str, w3: str,
                      x_pos: torch.Tensor, allow_cache: bool = True,
@@ -896,16 +968,16 @@ class NeuroSymbolicGraphGenerator:
         w_pair = w_pair / (w_pair.mean() + 1e-12)
         boosts = boosts + self.pairwise_strength * w_pair
 
-        # ABSTRACT COINAGE MODE MODIFICATIONS
+        # NARRATIVE MODE MODIFICATIONS
         if abstract_coinage_mode:
-            # Add creative novelty boost
+            # Add refined vocabulary boost
             creative_boost = self._compute_abstract_coinage_boost(
                 cand, w1, w2, w3, prep, coinage_creativity
             )
             boosts = boosts + creative_boost
             
-            # Increase temperature for more diverse sampling
-            effective_temp_mult = 1.5
+            # Moderate temperature increase for natural variety
+            effective_temp_mult = 1.2
         else:
             effective_temp_mult = 1.0
 
@@ -920,7 +992,12 @@ class NeuroSymbolicGraphGenerator:
         base_flow_t = torch.tensor(base_flow, dtype=torch.float32, device=device).clamp(0.0, 1.0)
         aesthetic_flow01 = (base_flow_t * (0.5 + 0.5 * x_pos)).clamp(0.0, 1.0)
 
-        g = self.fuzzy_ctl(entropy01, peak01, boost01, aesthetic_flow01, osculator_strength=self.osculator_strength)
+        # Compute trigram position indexes
+        trigram_positions = self._compute_trigram_positions(w1, w2, w3, prep)
+
+        g = self.fuzzy_ctl(entropy01, peak01, boost01, aesthetic_flow01, 
+                          osculator_strength=self.osculator_strength,
+                          trigram_positions=trigram_positions)
         effective_steer = self.base_steer * g
         effective_temp = self.base_temp * (1.2 - 0.7 * g) * effective_temp_mult
 
@@ -944,7 +1021,7 @@ class NeuroSymbolicGraphGenerator:
                  tokens_per_turn: int = 50, problem_solving_mode: bool = True,
                  target_flow: Optional[float] = None,
                  abstract_coinage_mode: bool = False,
-                 coinage_creativity: float = 0.8) -> Tuple[str, GenerationMetrics]:
+                 coinage_creativity: float = 0.7) -> Tuple[str, GenerationMetrics]:
         rng = np.random.default_rng(int(seed))
         seed_toks = basic_tokenize(prompt)
         w1, w2, w3 = self._pick_initial_context(prep.state.lm, seed_toks)
@@ -1113,10 +1190,7 @@ class NeuroSymbolicGraphGenerator:
         lines = []
         
         if abstract_coinage_mode:
-            lines.append("◈" * 60)
-            lines.append("ABSTRACT NARRATIVE SYNTHESIS")
-            lines.append("A Flow Through Conceptual Space")
-            lines.append("◈" * 60)
+            # Clean, professional narrative format
             lines.append("")
         elif problem_solving_mode:
             lines.append("=" * 60)
@@ -1128,10 +1202,9 @@ class NeuroSymbolicGraphGenerator:
             text = detokenize(tokens)
             if text.strip():
                 if abstract_coinage_mode:
-                    # Poetic/abstract formatting
-                    lines.append(f"◇ {role} ◇")
-                    lines.append(f"   [{mode}] — flow: {x_bias:.3f}")
-                    lines.append(f"   {text}")
+                    # Simple, readable format
+                    lines.append(f"**{role}**")
+                    lines.append(f"{text}")
                     lines.append("")
                 elif problem_solving_mode:
                     lines.append(f"[{role.upper()}] ({mode}, flow: {x_bias:.2f})")
@@ -1142,9 +1215,7 @@ class NeuroSymbolicGraphGenerator:
                     lines.append("")
         
         if abstract_coinage_mode:
-            lines.append("◈" * 60)
-            lines.append("END OF SYNTHESIS")
-            lines.append("◈" * 60)
+            lines.append("")
         elif problem_solving_mode:
             lines.append("=" * 60)
             lines.append("END OF SESSION")
@@ -1246,10 +1317,10 @@ def toggle_mode(abstract_val):
     return gr.update(visible=abstract_val)
 
 def build_app():
-    with gr.Blocks(title="NeuroSymbolic Abstract Generator", theme=gr.themes.Soft()) as demo:
+    with gr.Blocks(title="NeuroSymbolic Narrative Generator", theme=gr.themes.Soft()) as demo:
         gr.Markdown("""
-        # NeuroSymbolic V6.5 - Abstract coinage Mode
-        Generate abstract narratives with creative token coinage and conceptual flow
+        # NeuroSymbolic V6.5 - Narrative Generation
+        Generate flowing narratives with sophisticated language and conceptual depth
         """)
         
         with gr.Row():
@@ -1266,16 +1337,16 @@ def build_app():
                             outputs=[hf_dataset, hf_split, hf_max_rows, text_file, file_info])
                 
                 gr.Markdown("### Generation Mode")
-                abstract_mode = gr.Checkbox(label="Abstract Coinage Mode", value=True)
-                creativity = gr.Slider(0.0, 1.0, value=0.8, step=0.05, label="Creative Novelty", 
-                                      info="Higher = more abstract, unusual combinations", visible=True)
+                abstract_mode = gr.Checkbox(label="Narrative Story Mode", value=True)
+                creativity = gr.Slider(0.0, 1.0, value=0.7, step=0.05, label="Creative Language", 
+                                      info="Higher = more sophisticated vocabulary and novel phrasing", visible=True)
                 
                 abstract_mode.change(toggle_mode, inputs=[abstract_mode], outputs=[creativity])
                 
                 gr.Markdown("### Parameters")
                 seed = gr.Number(value=42, label="Seed")
                 maxtokens = gr.Slider(100, 1000, value=400, step=50, label="Tokens")
-                num_speakers = gr.Slider(2, 6, value=4, step=1, label="Voices/Roles")
+                num_speakers = gr.Slider(2, 6, value=4, step=1, label="Narrative Voices")
                 
                 with gr.Accordion("Advanced", open=False):
                     steer = gr.Slider(0.5, 3, value=1.35, step=0.05, label="Steer strength")
@@ -1284,12 +1355,12 @@ def build_app():
 
             with gr.Column(scale=2):
                 prompt = gr.Textbox(
-                    label="Seed Prompt", 
-                    value="The essence crystallizes", 
+                    label="Starting Prompt", 
+                    value="Consider the nature of understanding", 
                     lines=2,
-                    info="Starting point for the narrative flow"
+                    info="Opening phrase to begin the narrative"
                 )
-                btn = gr.Button("✨ Generate Abstract Narrative", variant="primary", size="lg")
+                btn = gr.Button("Generate Narrative", variant="primary", size="lg")
                 
                 output_text = gr.Textbox(label="Generated Narrative", lines=25, show_copy_button=True)
                 output_stats = gr.Textbox(label="Generation Statistics", lines=10)
@@ -1303,15 +1374,15 @@ def build_app():
         )
         
         gr.Markdown("""
-        ### About Abstract Coinage Mode
+        ### About Narrative Mode
         
-        This mode generates flowing abstract narratives by:
-        - **Favoring rare, complex vocabulary** over common words
-        - **Encouraging conceptual jumps** between dissimilar semantic spaces  
-        - **Disabling continuity constraints** for more creative freedom
-        - **Using poetic narrative voices** instead of problem-solving roles
+        This mode generates sophisticated narratives by:
+        - **Using natural but refined vocabulary** with appropriate complexity
+        - **Building ideas progressively** through different narrative voices
+        - **Maintaining conceptual coherence** while introducing novel connections
+        - **Balancing accessibility with depth** in language and structure
         
-        Adjust **Creative Novelty** to control how abstract and unusual the language becomes.
+        Adjust **Creative Language** to control vocabulary sophistication and phrasing novelty.
         """)
 
     return demo

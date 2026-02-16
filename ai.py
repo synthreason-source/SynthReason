@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-NeuroSymbolic V6.5 - Single Session Generator
+NeuroSymbolic V6.5 - Abstract Coinage Story Mode
 Features:
-- Single-Entity Problem Solving (One Session)
-- Neurosymbolic Graph Generation
-- Streamlined UI (No comparisons, no decision analysis)
+- Abstract narrative generation with creative token coinage
+- Conceptual blending and unusual semantic connections
+- Flow-based storytelling with invented language patterns
 """
 
 from __future__ import annotations
@@ -224,6 +224,18 @@ STOP_WORDS = set(
     which who will with you your yours
     """.split()
 )
+
+# Abstract coinage narrative markers
+NARRATIVE_FLOW_MARKERS = {
+    "essence": 0.15,
+    "crystalline": 0.25,
+    "manifold": 0.35,
+    "liminal": 0.45,
+    "recursive": 0.55,
+    "emergent": 0.65,
+    "transcendent": 0.75,
+    "infinite": 0.85,
+}
 
 PROBLEM_PATTERNS = [
     r"(?:problem|issue|challenge|difficulty|question|dilemma|paradox|conundrum|puzzle|obstacle)[s]?\s*(?:of|in|with|for|to)?\s*(?:the\s+)?(?:\w+\s*){0,10}\?",
@@ -706,6 +718,9 @@ class GenerationMetrics:
     assertion_count: int
     avg_aesthetic_flow: float
     total_tokens: int
+    abstract_density: float = 0.0
+    conceptual_jumps: int = 0
+    unique_combinations: int = 0
 
 
 # ----------------------------
@@ -824,9 +839,38 @@ class NeuroSymbolicGraphGenerator:
         if self.hemi_enable: self.hemi.reset()
         return PreparedCorpus(text=text, tokens=tokens, state=state)
 
+    def _compute_abstract_coinage_boost(self, cand: List[str], w1: str, w2: str, w3: str, 
+                                       prep: PreparedCorpus, creativity: float) -> torch.Tensor:
+        """Boost tokens based on abstract/novel combinations"""
+        device = prep.state.activator.emb.weight.device
+        boost = torch.zeros(len(cand), dtype=torch.float32, device=device)
+        
+        # Favor longer, more complex words (abstract language)
+        for i, word in enumerate(cand):
+            # Length boost
+            if len(word) >= 7:
+                boost[i] += 0.3 * creativity
+            elif len(word) >= 5:
+                boost[i] += 0.15 * creativity
+            
+            # Rare word boost (inverse frequency)
+            freq = prep.state.lm.uni.get(word, 0)
+            if freq > 0 and prep.state.lm.total > 0:
+                rarity = 1.0 - (freq / prep.state.lm.total)
+                boost[i] += 0.4 * rarity * creativity
+            
+            # Semantic distance from context (novelty)
+            pair = SymbolicPair.from_tokens(w3, word)
+            if pair.harmony < 0.5:  # dissimilar = novel
+                boost[i] += 0.25 * (1.0 - pair.harmony) * creativity
+        
+        return boost
+
     def _final_probs(self, prep: PreparedCorpus, w1: str, w2: str, w3: str,
-                     x_pos: torch.Tensor, allow_cache: bool = True) -> Tuple[List[str], torch.Tensor, torch.Tensor]:
-        cache_ok = allow_cache and (not x_pos.requires_grad) and (x_pos.numel() == 1)
+                     x_pos: torch.Tensor, allow_cache: bool = True,
+                     abstract_coinage_mode: bool = False,
+                     coinage_creativity: float = 0.8) -> Tuple[List[str], torch.Tensor, torch.Tensor]:
+        cache_ok = allow_cache and (not x_pos.requires_grad) and (x_pos.numel() == 1) and (not abstract_coinage_mode)
         key = None
         if cache_ok:
             key = (self.cache_version, w1, w2, w3, float(x_pos.item()))
@@ -852,6 +896,19 @@ class NeuroSymbolicGraphGenerator:
         w_pair = w_pair / (w_pair.mean() + 1e-12)
         boosts = boosts + self.pairwise_strength * w_pair
 
+        # ABSTRACT COINAGE MODE MODIFICATIONS
+        if abstract_coinage_mode:
+            # Add creative novelty boost
+            creative_boost = self._compute_abstract_coinage_boost(
+                cand, w1, w2, w3, prep, coinage_creativity
+            )
+            boosts = boosts + creative_boost
+            
+            # Increase temperature for more diverse sampling
+            effective_temp_mult = 1.5
+        else:
+            effective_temp_mult = 1.0
+
         context_str = f"{w1} {w2} {w3}"
         gravity = 0.0
         if "[PROBLEM]" in context_str: gravity = 0.2
@@ -865,15 +922,16 @@ class NeuroSymbolicGraphGenerator:
 
         g = self.fuzzy_ctl(entropy01, peak01, boost01, aesthetic_flow01, osculator_strength=self.osculator_strength)
         effective_steer = self.base_steer * g
-        effective_temp = self.base_temp * (1.2 - 0.7 * g)
+        effective_temp = self.base_temp * (1.2 - 0.7 * g) * effective_temp_mult
 
         potentials = torch.log(base_p.to(device=device).clamp_min(1e-12)) + effective_steer * boosts
         potentials = potentials / torch.clamp(effective_temp, min=1e-6)
         final_probs = F.softmax(potentials, dim=-1)
 
         hemi_pen = torch.tensor(0.0, device=device, dtype=final_probs.dtype)
-        if self.hemi_enable:
+        if self.hemi_enable and not abstract_coinage_mode:  # Disable hemi for more creativity
             final_probs, hemi_pen = self.hemi.apply(cand, final_probs)
+        
         flow_vec = torch.tensor([prep.state.problem_flow_by_token.get(w, 0.0) for w in cand], dtype=torch.float32, device=device).clamp(0.0, 1.0)
 
         out = (cand, final_probs, flow_vec)
@@ -884,20 +942,35 @@ class NeuroSymbolicGraphGenerator:
     def generate(self, prep: PreparedCorpus, prompt: str, start_x: float,
                  max_tokens: int = 220, seed: int = 42, num_speakers: int = 2,
                  tokens_per_turn: int = 50, problem_solving_mode: bool = True,
-                 target_flow: Optional[float] = None) -> Tuple[str, GenerationMetrics]:
+                 target_flow: Optional[float] = None,
+                 abstract_coinage_mode: bool = False,
+                 coinage_creativity: float = 0.8) -> Tuple[str, GenerationMetrics]:
         rng = np.random.default_rng(int(seed))
         seed_toks = basic_tokenize(prompt)
         w1, w2, w3 = self._pick_initial_context(prep.state.lm, seed_toks)
         device = prep.state.activator.emb.weight.device
         total_steps = int(max_tokens)
         
-        role_definitions = [
-            ("Problem Poser", 0.0, 0.25, "questioning", ["?", "what", "how", "why"]),
-            ("Analyzer", 0.2, 0.45, "analyzing", ["because", "consider", "examine", "observe"]),
-            ("Solution Proposer", 0.4, 0.7, "proposing", ["solution", "approach", "method", "could"]),
-            ("Critic", 0.5, 0.75, "critiquing", ["however", "but", "issue", "problem"]),
-            ("Synthesizer", 0.7, 1.0, "synthesizing", ["therefore", "thus", "overall", "combining"]),
-        ]
+        if abstract_coinage_mode:
+            # Abstract narrative roles with flow-based positioning
+            role_definitions = [
+                ("Essence Weaver", 0.0, 0.2, "crystallizing", ["essence", "crystalline", "pure", "distilled"]),
+                ("Manifold Navigator", 0.15, 0.35, "traversing", ["manifold", "dimensional", "layered", "fold"]),
+                ("Liminal Observer", 0.3, 0.5, "witnessing", ["liminal", "threshold", "boundary", "between"]),
+                ("Recursive Architect", 0.45, 0.65, "constructing", ["recursive", "self", "iteration", "cycle"]),
+                ("Emergent Synthesizer", 0.6, 0.8, "integrating", ["emergent", "arising", "becoming", "synthesis"]),
+                ("Transcendent Voice", 0.75, 1.0, "ascending", ["transcendent", "beyond", "infinite", "eternal"]),
+            ]
+        else:
+            # Original problem-solving roles
+            role_definitions = [
+                ("Problem Poser", 0.0, 0.25, "questioning", ["?", "what", "how", "why"]),
+                ("Analyzer", 0.2, 0.45, "analyzing", ["because", "consider", "examine", "observe"]),
+                ("Solution Proposer", 0.4, 0.7, "proposing", ["solution", "approach", "method", "could"]),
+                ("Critic", 0.5, 0.75, "critiquing", ["however", "but", "issue", "problem"]),
+                ("Synthesizer", 0.7, 1.0, "synthesizing", ["therefore", "thus", "overall", "combining"]),
+            ]
+        
         speaker_roles = []
         for i in range(int(num_speakers)):
             role_idx = i % len(role_definitions)
@@ -917,6 +990,11 @@ class NeuroSymbolicGraphGenerator:
         assertion_count = 0
         aesthetic_flows = []
         current_sentence_length = 0
+        
+        # Abstract coinage tracking
+        prev_tokens = [w1, w2, w3]
+        conceptual_jumps = 0
+        unique_pairs = set()
 
         for i in range(total_steps):
             role_name, x_min, x_max, mode, keywords = speaker_roles[current_speaker_idx]
@@ -931,9 +1009,13 @@ class NeuroSymbolicGraphGenerator:
                 curr_x_val = max(x_min, min(x_max, curr_x_val))
             
             x = torch.tensor(float(curr_x_val), dtype=torch.float32, device=device)
-            cand, probs, flow_vec = self._final_probs(prep, w1, w2, w3, x_pos=x, allow_cache=True)
+            cand, probs, flow_vec = self._final_probs(
+                prep, w1, w2, w3, x_pos=x, allow_cache=not abstract_coinage_mode,
+                abstract_coinage_mode=abstract_coinage_mode,
+                coinage_creativity=coinage_creativity
+            )
             
-            if keywords and problem_solving_mode:
+            if keywords and not abstract_coinage_mode:
                 keyword_boost = torch.zeros_like(probs)
                 for idx, c in enumerate(cand):
                     if c.lower() in keywords:
@@ -943,29 +1025,23 @@ class NeuroSymbolicGraphGenerator:
                 probs = probs * torch.exp(keyword_boost)
                 probs = probs / (probs.sum() + 1e-12)
             
-            if target_flow is not None:
-                # ARGMAX FLOW
-                count = max(1, role_flow_counts[role_name])
-                running_avg = role_flow_sums[role_name] / count
-                k_top = 64
-                top_k_indices = torch.topk(probs, min(k_top, len(probs))).indices
-                best_score = -float('inf')
-                idx = top_k_indices[0].item()
-                for cand_idx in top_k_indices:
-                    cand_idx = int(cand_idx.item())
-                    next_avg = (running_avg * count + flow_vec[cand_idx].item()) / (count + 1)
-                    flow_penalty = 0.5 * abs(next_avg - target_flow)**2
-                    lm_score = math.log(probs[cand_idx].item() + 1e-12)
-                    score = lm_score - flow_penalty * 10.0
-                    if score > best_score:
-                        best_score = score
-                        idx = cand_idx
-                tok = cand[idx]
-            else:
-                p = probs.detach().cpu().numpy()
-                p = p / (p.sum() + 1e-12)
-                idx = rng.choice(len(cand), p=p)
-                tok = cand[idx]
+            # Sample from distribution
+            p = probs.detach().cpu().numpy()
+            p = p / (p.sum() + 1e-12)
+            idx = rng.choice(len(cand), p=p)
+            tok = cand[idx]
+
+            # Track abstract metrics
+            if abstract_coinage_mode:
+                # Track conceptual jumps (semantic distance)
+                if len(prev_tokens) >= 3:
+                    pair = SymbolicPair.from_tokens(prev_tokens[-1], tok)
+                    if pair.harmony < 0.4:  # Low harmony = conceptual jump
+                        conceptual_jumps += 1
+                unique_pairs.add((prev_tokens[-1] if prev_tokens else "", tok))
+                prev_tokens.append(tok)
+                if len(prev_tokens) > 5:
+                    prev_tokens.pop(0)
 
             current_turn_tokens.append(tok)
             role_token_counts[role_name] += 1
@@ -988,10 +1064,13 @@ class NeuroSymbolicGraphGenerator:
             if re.match(r"[A-Za-z]", tok): alpha_count_turn += 1
             
             should_switch = False
-            if tok in [".", "!", "?"] and alpha_count_turn >= min(tokens_per_turn * 0.6, 20): should_switch = True
-            elif len(current_turn_tokens) >= tokens_per_turn * 1.5: should_switch = True
+            if tok in [".", "!", "?"] and alpha_count_turn >= min(tokens_per_turn * 0.6, 20): 
+                should_switch = True
+            elif len(current_turn_tokens) >= tokens_per_turn * 1.5: 
+                should_switch = True
             elif len(current_turn_tokens) >= tokens_per_turn and alpha_count_turn > 15:
-                if tok in [",", ";"] or (i > 0 and rng.random() < 0.3): should_switch = True
+                if tok in [",", ";"] or (i > 0 and rng.random() < 0.3): 
+                    should_switch = True
             
             if should_switch and current_turn_tokens:
                 conversation.append((role_name, mode, list(current_turn_tokens), role_x_bias))
@@ -1005,6 +1084,13 @@ class NeuroSymbolicGraphGenerator:
             conversation.append((role_name, mode, current_turn_tokens, role_x_bias))
 
         role_avg_flow = {role: role_flow_sums[role] / role_flow_counts[role] if role_flow_counts[role] > 0 else 0.0 for role in role_token_counts.keys()}
+        
+        # Calculate abstract density (avg word length, rarity)
+        all_tokens = []
+        for _, _, tokens, _ in conversation:
+            all_tokens.extend(tokens)
+        abstract_density = sum(len(t) for t in all_tokens if re.match(r"[A-Za-z]", t)) / max(1, len(all_tokens))
+        
         metrics = GenerationMetrics(
             role_token_counts=role_token_counts,
             role_avg_flow=role_avg_flow,
@@ -1013,32 +1099,57 @@ class NeuroSymbolicGraphGenerator:
             question_count=question_count,
             assertion_count=assertion_count,
             avg_aesthetic_flow=sum(aesthetic_flows)/len(aesthetic_flows) if aesthetic_flows else 0.0,
-            total_tokens=total_steps
+            total_tokens=total_steps,
+            abstract_density=abstract_density,
+            conceptual_jumps=conceptual_jumps,
+            unique_combinations=len(unique_pairs)
         )
-        text = self.format_conversation(conversation, problem_solving_mode)
+        
+        text = self.format_conversation(conversation, problem_solving_mode, abstract_coinage_mode)
         return text, metrics
 
-    def format_conversation(self, conversation: List[Tuple[str, str, List[str], float]], problem_solving_mode: bool) -> str:
+    def format_conversation(self, conversation: List[Tuple[str, str, List[str], float]], 
+                          problem_solving_mode: bool, abstract_coinage_mode: bool = False) -> str:
         lines = []
-        if problem_solving_mode:
+        
+        if abstract_coinage_mode:
+            lines.append("◈" * 60)
+            lines.append("ABSTRACT NARRATIVE SYNTHESIS")
+            lines.append("A Flow Through Conceptual Space")
+            lines.append("◈" * 60)
+            lines.append("")
+        elif problem_solving_mode:
             lines.append("=" * 60)
             lines.append("SINGLE-ENTITY PROBLEM SOLVING SESSION")
             lines.append("=" * 60)
             lines.append("")
+        
         for role, mode, tokens, x_bias in conversation:
             text = detokenize(tokens)
             if text.strip():
-                if problem_solving_mode:
+                if abstract_coinage_mode:
+                    # Poetic/abstract formatting
+                    lines.append(f"◇ {role} ◇")
+                    lines.append(f"   [{mode}] — flow: {x_bias:.3f}")
+                    lines.append(f"   {text}")
+                    lines.append("")
+                elif problem_solving_mode:
                     lines.append(f"[{role.upper()}] ({mode}, flow: {x_bias:.2f})")
                     lines.append(f"{text}")
                     lines.append("")
                 else:
                     lines.append(f"{role}: {text}")
                     lines.append("")
-        if problem_solving_mode:
+        
+        if abstract_coinage_mode:
+            lines.append("◈" * 60)
+            lines.append("END OF SYNTHESIS")
+            lines.append("◈" * 60)
+        elif problem_solving_mode:
             lines.append("=" * 60)
             lines.append("END OF SESSION")
             lines.append("=" * 60)
+        
         return "\n".join(lines)
 
 
@@ -1069,14 +1180,15 @@ def _load_corpus(use_hf: bool, hf_dataset: str, hf_split: str, hf_max_rows: int,
 
 def run_session(use_hf, hf_dataset, hf_split, hf_max_rows, text_file, 
                 prompt, seed, maxtokens, num_speakers, 
-                steer, focus, pairwise, progress=gr.Progress()):
+                steer, focus, pairwise, abstract_mode, creativity, progress=gr.Progress()):
     try:
         progress(0.0, desc="Loading corpus...")
         corpus_text = _load_corpus(bool(use_hf), str(hf_dataset), str(hf_split), int(hf_max_rows), text_file)
         
         gen = NeuroSymbolicGraphGenerator(
             steer_strength=float(steer), focus_strength=float(focus), 
-            pairwise_strength=float(pairwise), activator_boot_epochs=15, hemi_enable=True
+            pairwise_strength=float(pairwise), activator_boot_epochs=15, 
+            hemi_enable=not abstract_mode  # Disable hemi for abstract mode
         )
         
         progress(0.2, desc="Preparing corpus...")
@@ -1085,17 +1197,33 @@ def run_session(use_hf, hf_dataset, hf_split, hf_max_rows, text_file,
         progress(0.5, desc="Generating Session...")
         text, metrics = gen.generate(
             prep, str(prompt), start_x=0.0, max_tokens=int(maxtokens), 
-            seed=int(seed), num_speakers=int(num_speakers), tokens_per_turn=60
+            seed=int(seed), num_speakers=int(num_speakers), tokens_per_turn=60,
+            problem_solving_mode=not abstract_mode,
+            abstract_coinage_mode=bool(abstract_mode),
+            coinage_creativity=float(creativity)
         )
         
-        # Simple Stats String
+        # Stats String
         stats = []
         stats.append(f"Total Tokens: {metrics.total_tokens}")
         stats.append(f"Average Flow: {metrics.avg_aesthetic_flow:.3f}")
-        stats.append(f"Questions: {metrics.question_count}, Assertions: {metrics.assertion_count}")
-        stats.append("Role Breakdown:")
+        
+        if abstract_mode:
+            stats.append(f"Abstract Density: {metrics.abstract_density:.3f}")
+            stats.append(f"Conceptual Jumps: {metrics.conceptual_jumps}")
+            stats.append(f"Unique Combinations: {metrics.unique_combinations}")
+        else:
+            stats.append(f"Questions: {metrics.question_count}, Assertions: {metrics.assertion_count}")
+        
+        stats.append("\nRole Breakdown:")
         for r, c in metrics.role_token_counts.items():
-            stats.append(f"  - {r}: {c} tokens")
+            avg_flow = metrics.role_avg_flow.get(r, 0.0)
+            stats.append(f"  {r}: {c} tokens (flow: {avg_flow:.3f})")
+        
+        if metrics.keyword_usage:
+            stats.append("\nTop Keywords:")
+            for kw, count in metrics.keyword_usage.most_common(5):
+                stats.append(f"  {kw}: {count}")
         
         return text, "\n".join(stats)
 
@@ -1113,13 +1241,20 @@ def toggle_corpus_source(use_hf_val):
         gr.update(visible=not use_hf_val), # file_info
     )
 
+def toggle_mode(abstract_val):
+    """Show/hide creativity slider based on abstract mode"""
+    return gr.update(visible=abstract_val)
+
 def build_app():
-    with gr.Blocks(title="NeuroSymbolic Generator") as demo:
-        gr.Markdown("# NeuroSymbolic V6.5 - Single Session Generator")
+    with gr.Blocks(title="NeuroSymbolic Abstract Generator", theme=gr.themes.Soft()) as demo:
+        gr.Markdown("""
+        # NeuroSymbolic V6.5 - Abstract Coinage Story Mode
+        Generate abstract narratives with creative token coinage and conceptual flow
+        """)
         
         with gr.Row():
             with gr.Column(scale=1):
-                gr.Markdown("### Corpus")
+                gr.Markdown("### Corpus Source")
                 use_hf = gr.Checkbox(label="Use Hugging Face dataset", value=True)
                 hf_dataset = gr.Textbox(label="HF Dataset", value="AiresPucrs/stanford-encyclopedia-philosophy", visible=True)
                 hf_split = gr.Textbox(label="Split", value="train", visible=True)
@@ -1127,29 +1262,57 @@ def build_app():
                 text_file = gr.File(label="Upload Text File", file_types=[".txt", ".md"], visible=False)
                 file_info = gr.Markdown("Using entire file as corpus.", visible=False)
                 
-                use_hf.change(toggle_corpus_source, inputs=[use_hf], outputs=[hf_dataset, hf_split, hf_max_rows, text_file, file_info])
+                use_hf.change(toggle_corpus_source, inputs=[use_hf], 
+                            outputs=[hf_dataset, hf_split, hf_max_rows, text_file, file_info])
+                
+                gr.Markdown("### Generation Mode")
+                abstract_mode = gr.Checkbox(label="Abstract Coinage Story Mode", value=True)
+                creativity = gr.Slider(0.0, 1.0, value=0.8, step=0.05, label="Creative Novelty", 
+                                      info="Higher = more abstract, unusual combinations", visible=True)
+                
+                abstract_mode.change(toggle_mode, inputs=[abstract_mode], outputs=[creativity])
                 
                 gr.Markdown("### Parameters")
                 seed = gr.Number(value=42, label="Seed")
-                maxtokens = gr.Slider(100, 1000, value=300, step=50, label="Tokens")
-                num_speakers = gr.Slider(2, 5, value=5, step=1, label="Roles")
-                steer = gr.Slider(0.5, 3, value=1.35, step=0.05, label="Steer strength")
-                focus = gr.Slider(0, 1, value=0.5, step=0.05, label="Focus strength")
-                pairwise = gr.Slider(0, 2, value=0.6, step=0.1, label="Pairwise strength")
+                maxtokens = gr.Slider(100, 1000, value=400, step=50, label="Tokens")
+                num_speakers = gr.Slider(2, 6, value=4, step=1, label="Voices/Roles")
+                
+                with gr.Accordion("Advanced", open=False):
+                    steer = gr.Slider(0.5, 3, value=1.35, step=0.05, label="Steer strength")
+                    focus = gr.Slider(0, 1, value=0.5, step=0.05, label="Focus strength")
+                    pairwise = gr.Slider(0, 2, value=0.6, step=0.1, label="Pairwise strength")
 
             with gr.Column(scale=2):
-                prompt = gr.Textbox(label="Prompt", value="What is the nature of consciousness?", lines=2)
-                btn = gr.Button("Generate", variant="primary", size="lg")
+                prompt = gr.Textbox(
+                    label="Seed Prompt", 
+                    value="The essence crystallizes", 
+                    lines=2,
+                    info="Starting point for the narrative flow"
+                )
+                btn = gr.Button("✨ Generate Abstract Narrative", variant="primary", size="lg")
                 
-                output_text = gr.Textbox(label="Session Output", lines=25)
-                output_stats = gr.Textbox(label="Session Stats", lines=8)
+                output_text = gr.Textbox(label="Generated Narrative", lines=25, show_copy_button=True)
+                output_stats = gr.Textbox(label="Generation Statistics", lines=10)
 
         btn.click(
             run_session,
             inputs=[use_hf, hf_dataset, hf_split, hf_max_rows, text_file, 
-                    prompt, seed, maxtokens, num_speakers, steer, focus, pairwise],
+                    prompt, seed, maxtokens, num_speakers, steer, focus, pairwise,
+                    abstract_mode, creativity],
             outputs=[output_text, output_stats]
         )
+        
+        gr.Markdown("""
+        ### About Abstract Coinage Mode
+        
+        This mode generates flowing abstract narratives by:
+        - **Favoring rare, complex vocabulary** over common words
+        - **Encouraging conceptual jumps** between dissimilar semantic spaces  
+        - **Disabling continuity constraints** for more creative freedom
+        - **Using poetic narrative voices** instead of problem-solving roles
+        
+        Adjust **Creative Novelty** to control how abstract and unusual the language becomes.
+        """)
 
     return demo
 

@@ -1266,7 +1266,7 @@ def build_app():
                             outputs=[hf_dataset, hf_split, hf_max_rows, text_file, file_info])
                 
                 gr.Markdown("### Generation Mode")
-                abstract_mode = gr.Checkbox(label="Abstract Coinage Story Mode", value=True)
+                abstract_mode = gr.Checkbox(label="Abstract Coinage Mode", value=True)
                 creativity = gr.Slider(0.0, 1.0, value=0.8, step=0.05, label="Creative Novelty", 
                                       info="Higher = more abstract, unusual combinations", visible=True)
                 

@@ -294,7 +294,7 @@ def _detok(toks: List[str]) -> str:
         else:
             out.append(t)
     s = ' '.join(out)
-    return re.sub(r'(^|[.!?] )([a-z])', lambda m: m.group(1) + m.group(2).upper(), s)
+    return re.sub(r'([a-z])', lambda m: m.group(1), s)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -408,7 +408,7 @@ def load_corpus(use_hf: bool, dataset: str, split: str, maxrows: int, file) -> s
     return open(path, encoding='utf-8', errors='replace').read()
 
 def tokenize(text: str) -> List[str]:
-    return [t.lower() for t in re.findall(r'[A-Za-z][A-Za-z0-9\'-]*', text)]
+    return [t.lower() for t in text.split()]
 
 
 # ══════════════════════════════════════════════════════════════

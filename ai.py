@@ -2,12 +2,13 @@
 # -*- coding: utf-8 -*-
 
 """
-NeuroSymbolic V7.0 - Professional Narrative Generation WITH CENTROID OF MEANING
+NeuroSymbolic V7.2 - Professional Narrative Generation WITH TOPOLOGY-SPIKY CENTROIDS & MASSIVE SAW WAVES
 New Features:
-- Semantic centroid computed for each token in vocabulary
+- Semantic centroid computed for each token in vocabulary (Topology-Spiky)
 - Centroid-aware generation: tokens near current centroid are boosted
 - Coherence tracking: measures semantic tightness
 - Multi-scale semantics: local (pairwise) + global (centroid)
+- MASSIVE SAW WAVES: periodic probability modulation simulating filtration steps
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Any
 from collections import OrderedDict, Counter
+from itertools import combinations
 
 import numpy as np
 import gradio as gr
@@ -39,168 +41,230 @@ class SemanticCentroid:
     centroid_vector: np.ndarray  # 4D: [harmony, density, momentum, resonance]
     neighbor_tokens: List[str]
     coherence: float  # How tightly clustered (0-1)
-    
+
     def distance_to(self, other: "SemanticCentroid") -> float:
         return float(np.linalg.norm(self.centroid_vector - other.centroid_vector))
-    
+
     def similarity_to(self, other: "SemanticCentroid") -> float:
         """Exponential decay: closer centroids = higher similarity"""
         return math.exp(-self.distance_to(other))
 
 
 class CentroidComputer:
-    """Computes and manages semantic centroids for tokens - OPTIMIZED VERSION"""
-    
+    """
+    Computes and manages semantic centroids for tokens - TOPOLOGY-SPIKY VERSION
+    """
+
+    # Topology vocabulary (extend freely)
+    TOPO_KEYWORDS = {
+        "homology", "cohomology", "persistent", "persistence", "simplicial",
+        "simplex", "simplices", "filtration", "barcode", "betti", "euler",
+        "characteristic", "chain", "cycle", "boundary", "coboundary",
+        "fundamental", "group", "pi1", "manifold", "cellular", "complex",
+        "topological", "topology", "morse", "nerve", "vietoris", "rips",
+        "cech", "cup", "cap", "spectral", "sequence", "homotopy", "sheaf"
+    }
+
     def __init__(self, max_neighbors: int = 30, max_vocab_size: int = 1000):
         self.max_neighbors = max_neighbors
         self.max_vocab_size = max_vocab_size  # Limit vocab for speed
         self.centroids: Dict[str, SemanticCentroid] = {}
-    
-    def compute_centroid_fast(self, token: str, vocabulary: List[str], 
+
+    def _topo_relevance(self, token: str) -> float:
+        """
+        0..1 score. Spiky for exact/substring hits.
+        """
+        tl = token.lower()
+        hit = 0
+        for kw in self.TOPO_KEYWORDS:
+            if kw in tl:
+                hit += 1
+        if hit <= 0:
+            return 0.0
+        # Spiky: multiple hits saturate quickly
+        return float(min(1.0, 0.55 + 0.25 * (hit - 1)))
+
+    def _pseudo_persistence(self, harmony: float, topo_rel: float) -> float:
+        """
+        Persistence-like scalar.
+        We simulate a filtration by using (1 - harmony) as a crude "death",
+        then amplify it for topo-relevant neighbors.
+        """
+        base = max(0.0, 1.0 - float(harmony))
+        # Spike: topo neighbors get much larger persistence mass
+        return base * (1.0 + 4.0 * topo_rel)
+
+    def _pseudo_betti(self, neighbor_tokens: List[str]) -> float:
+        """
+        Betti-1 proxy: count topo-relevant 3-cliques.
+        This is intentionally cheap and spiky.
+        """
+        if len(neighbor_tokens) < 3:
+            return 0.0
+        rel = [t for t in neighbor_tokens if self._topo_relevance(t) >= 0.5]
+        if len(rel) < 3:
+            return 0.0
+        # Count triads as a crude cycle proxy; saturate fast
+        triads = 0
+        for _a, _b, _c in combinations(rel[:12], 3):  # cap for speed
+            triads += 1
+            if triads >= 20:
+                break
+        return float(min(1.0, triads / 20.0))
+
+    def compute_centroid_fast(self, token: str, vocabulary: List[str],
                              freq_dict: Optional[Dict[str, int]] = None) -> SemanticCentroid:
         """
-        FAST centroid computation with optimizations:
-        - Only compute for top vocab by frequency
-        - Batch vector operations
-        - Early stopping for low-harmony pairs
+        FAST centroid computation with optimizations + TOPO SPIKES
         """
         from __main__ import SymbolicPair
-        
-        # Quick approximation: only use top harmonious neighbors
+
         top_neighbors = []
-        
-        for other_token in vocabulary[:min(200, len(vocabulary))]:  # Sample for speed
+
+        for other_token in vocabulary[:min(220, len(vocabulary))]:  # slightly larger sample
             if other_token == token:
                 continue
-            
-            # Quick harmony check (edit distance is expensive)
+
+            # Fast pre-filter: large length difference = low harmony
             if len(token) > 0 and len(other_token) > 0:
-                # Fast pre-filter: large length difference = low harmony
                 if abs(len(token) - len(other_token)) > min(len(token), len(other_token)):
                     continue
-            
+
             pair = SymbolicPair.from_tokens(token, other_token)
-            
-            # Early stopping: skip very low harmony pairs
-            if pair.harmony < 0.1:
+
+            # Keep original harmony floor, but topo tokens can survive slightly lower harmony
+            topo_rel = self._topo_relevance(other_token)
+            if pair.harmony < (0.10 - 0.04 * topo_rel):
                 continue
-            
+
             aesthetic_vec = pair.aesthetic_vector()
+
+            # Base weight from frequency
             weight = 1.0
             if freq_dict is not None:
                 freq = freq_dict.get(other_token, 1)
                 weight = math.log(1 + freq)
-            
-            top_neighbors.append((pair.harmony, weight, other_token, aesthetic_vec))
-        
-        # Sort by harmony and take top N
+
+            # Topology spikes: persistence + betti proxy
+            pers = self._pseudo_persistence(pair.harmony, topo_rel)
+
+            # Add a sharp topo spike multiplier (kept bounded)
+            spike_mult = 1.0 + 3.5 * topo_rel + 2.0 * min(1.0, pers)
+
+            # Betti proxy uses already-collected neighbor tokens (cheap)
+            existing_neighbors = [tok for (_h, _w, tok, _v) in top_neighbors]
+            betti = self._pseudo_betti(existing_neighbors + [other_token])
+
+            # Inject betti into the density dimension (index 1) for spikiness
+            vec = aesthetic_vec.copy()
+            vec[1] = float(np.clip(vec[1] * (1.0 + 2.5 * betti * topo_rel), 0.0, 5.0))
+
+            weight = weight * spike_mult
+
+            top_neighbors.append((pair.harmony + 0.15 * topo_rel, weight, other_token, vec))
+
+        # Sort by (modified) harmony and take top N
         top_neighbors.sort(key=lambda x: x[0], reverse=True)
         top_neighbors = top_neighbors[:self.max_neighbors]
-        
+
         if not top_neighbors:
-            # No neighbors found, return default centroid
             return SemanticCentroid(
                 token=token,
                 centroid_vector=np.zeros(4, dtype=np.float32),
                 neighbor_tokens=[],
                 coherence=0.0
             )
-        
+
         neighbor_tokens = [tok for (_, _, tok, _) in top_neighbors]
         weighted_vectors = [vec * weight for (_, weight, _, vec) in top_neighbors]
-        
-        # Batch compute centroid
+
         vectors_array = np.stack(weighted_vectors)
         centroid_vec = np.mean(vectors_array, axis=0)
-        
-        # Fast coherence estimate
+
         distances = np.linalg.norm(vectors_array - centroid_vec, axis=1)
         coherence = 1.0 - (np.mean(distances) / (np.max(distances) + 1e-12))
         coherence = float(np.clip(coherence, 0.0, 1.0))
-        
+
         return SemanticCentroid(
             token=token,
-            centroid_vector=centroid_vec,
+            centroid_vector=centroid_vec.astype(np.float32),
             neighbor_tokens=neighbor_tokens,
             coherence=coherence
         )
-    
-    def compute_all_centroids(self, tokens: List[str], 
+
+    def compute_all_centroids(self, tokens: List[str],
                              freq_dict: Optional[Dict[str, int]] = None,
                              progress=None) -> Dict[str, SemanticCentroid]:
         """Compute centroids for all unique tokens - OPTIMIZED"""
         unique_tokens = list(set(tokens))
-        
-        # OPTIMIZATION 1: Only compute for most frequent tokens
+
         if freq_dict and len(unique_tokens) > self.max_vocab_size:
-            # Sort by frequency and take top tokens
-            sorted_tokens = sorted(unique_tokens, 
-                                  key=lambda t: freq_dict.get(t, 0), 
+            sorted_tokens = sorted(unique_tokens,
+                                  key=lambda t: freq_dict.get(t, 0),
                                   reverse=True)
             unique_tokens = sorted_tokens[:self.max_vocab_size]
-            
+
             if progress:
                 progress(0.15, desc=f"Computing centroids for top {len(unique_tokens)} tokens...")
         else:
             if progress:
                 progress(0.15, desc=f"Computing centroids for {len(unique_tokens)} tokens...")
-        
-        # OPTIMIZATION 2: Batch progress updates
+
         batch_size = 50
         for i in range(0, len(unique_tokens), batch_size):
             batch = unique_tokens[i:i+batch_size]
-            
+
             for token in batch:
                 self.centroids[token] = self.compute_centroid_fast(
                     token, unique_tokens, freq_dict=freq_dict
                 )
-            
+
             if progress:
                 pct = 0.15 + 0.05 * (i / len(unique_tokens))
                 progress(pct, desc=f"Centroids: {i}/{len(unique_tokens)}")
-        
+
         return self.centroids
-    
+
     def get_centroid_boost(self, current_token: str, candidate_tokens: List[str],
                           boost_strength: float = 0.3) -> np.ndarray:
         """
         Compute centroid-based boost for candidate tokens.
-        Tokens with centroids near the current token's centroid get boosted.
-        
-        This creates "semantic gravity" that pulls generation toward
-        related concepts in the 4D aesthetic space.
+        TOPO SPIKE: candidate topo relevance multiplies the similarity boost
         """
         if current_token not in self.centroids:
             return np.zeros(len(candidate_tokens), dtype=np.float32)
-        
+
         current_centroid = self.centroids[current_token]
         boosts = []
-        
+
         for candidate in candidate_tokens:
             if candidate in self.centroids:
-                # Similarity decays exponentially with distance
                 similarity = current_centroid.similarity_to(self.centroids[candidate])
-                boost = boost_strength * similarity
+                topo_rel = self._topo_relevance(candidate)
+                # Spiky topo multiplier
+                boost = boost_strength * similarity * (1.0 + 3.0 * topo_rel)
             else:
                 boost = 0.0
             boosts.append(boost)
-        
+
         return np.array(boosts, dtype=np.float32)
-    
+
     def get_summary_stats(self) -> Dict[str, Any]:
         """Get summary statistics about centroids"""
         if not self.centroids:
             return {}
-        
+
         coherences = [c.coherence for c in self.centroids.values()]
+        topo_hi = [t for t in self.centroids.keys() if self._topo_relevance(t) >= 0.5][:10]
         return {
             "total_centroids": len(self.centroids),
-            "avg_coherence": np.mean(coherences),
-            "min_coherence": np.min(coherences),
-            "max_coherence": np.max(coherences),
+            "avg_coherence": float(np.mean(coherences)),
+            "min_coherence": float(np.min(coherences)),
+            "max_coherence": float(np.max(coherences)),
             "high_coherence_tokens": [
                 t for t, c in self.centroids.items() if c.coherence > 0.7
-            ][:10]
+            ][:10],
+            "topology_hint_tokens": topo_hi,
         }
 
 
@@ -347,7 +411,7 @@ class NeuronalActivator(nn.Module):
 
         vecs = [SymbolicPair.from_tokens(a, b).aesthetic_vector() for a, b, _ in pairs]
         y = torch.tensor(np.array(vecs), dtype=torch.float32)
-        
+
         self.update_global_mean(y)
 
         device = self.emb.weight.device
@@ -412,6 +476,7 @@ SOLUTION_PATTERNS = [
     r"(?:solved|resolved|fixed|addressed|overcome|tackled)\s+(?:by|using|through|with)\s*(?:the\s+)?(?:\w+\s*){0,10}",
 ]
 
+
 def inject_cognitive_tokens(text: str) -> str:
     lines = text.split("\n")
     marked = []
@@ -434,11 +499,13 @@ def inject_cognitive_tokens(text: str) -> str:
         marked.append(line)
     return "\n".join(marked)
 
+
 def normalize(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
 
 def basic_tokenize(text: str) -> List[str]:
     text = text.replace("\n", " ")
@@ -452,6 +519,7 @@ def basic_tokenize(text: str) -> List[str]:
         else:
             out.append(t)
     return out
+
 
 def detokenize(tokens: List[str]) -> str:
     out = []
@@ -476,6 +544,7 @@ def detokenize(tokens: List[str]) -> str:
     s = re.sub(r"\s+\)", ")", s)
     s = re.sub(r"(^|[.!?]\s+)([a-z])", lambda m: m.group(1) + m.group(2).upper(), s)
     return s
+
 
 def load_text(path: str) -> str:
     p = Path(path)
@@ -512,6 +581,7 @@ def compute_problem_flow_by_token(tokens: List[str]) -> Dict[str, float]:
             seg_start = None
     return {t: float(sum(v) / len(v)) for t, v in acc.items()}
 
+
 def pure_tfidf(docs: List[str], max_features: int = 8000) -> Tuple[np.ndarray, List[str]]:
     all_words = set()
     for doc in docs:
@@ -535,6 +605,7 @@ def pure_tfidf(docs: List[str], max_features: int = 8000) -> Tuple[np.ndarray, L
                 idf = math.log(len(docs) / (1 + df))
                 X[i, j] = tf * idf
     return X, vocab
+
 
 def pure_truncated_svd(X: np.ndarray, n_components: int, random_state: int = 42) -> Any:
     np.random.seed(random_state)
@@ -602,6 +673,7 @@ def mf_tri(x: torch.Tensor, a: float, b: float, c: float) -> torch.Tensor:
     right = (c - x) / max(1e-9, (c - b))
     return torch.clamp(torch.minimum(left, right), 0.0, 1.0)
 
+
 def mf_trap(x: torch.Tensor, a: float, b: float, c: float, d: float) -> torch.Tensor:
     x = x.clamp(min=min(a, d), max=max(a, d))
     up = (x - a) / max(1e-9, (b - a))
@@ -609,11 +681,14 @@ def mf_trap(x: torch.Tensor, a: float, b: float, c: float, d: float) -> torch.Te
     one = torch.tensor(1.0, device=x.device, dtype=x.dtype)
     return torch.clamp(torch.minimum(torch.minimum(up, one), down), 0.0, 1.0)
 
+
 def tnorm_prod(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return a * b
 
+
 def snorm_max(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return torch.maximum(a, b)
+
 
 class FuzzyWeightController(nn.Module):
     def __init__(self):
@@ -631,68 +706,57 @@ class FuzzyWeightController(nn.Module):
         b = boost01.clamp(0, 1)
         a = aesthetic_flow01.clamp(0, 1)
 
-        # Use trigram positions if provided, otherwise use default [0.0, 0.5, 1.0]
         if trigram_positions is not None:
             pos1, pos2, pos3 = trigram_positions
         else:
             pos1, pos2, pos3 = 0.0, 0.5, 1.0
-        
-        # Convert positions to tensors
+
         pos1_t = torch.tensor(pos1, device=e.device, dtype=torch.float32)
         pos2_t = torch.tensor(pos2, device=e.device, dtype=torch.float32)
         pos3_t = torch.tensor(pos3, device=e.device, dtype=torch.float32)
 
-        # Position-indexed membership functions for entropy (e)
-        # e_low uses pos1 to shift boundaries
-        e_low  = mf_trap(e, 0.0 * (1.0 - pos1_t) + 0.1 * pos1_t, 
-                            0.0 * (1.0 - pos1_t) + 0.15 * pos1_t, 
-                            0.25 + 0.1 * pos1_t, 
+        e_low  = mf_trap(e, 0.0 * (1.0 - pos1_t) + 0.1 * pos1_t,
+                            0.0 * (1.0 - pos1_t) + 0.15 * pos1_t,
+                            0.25 + 0.1 * pos1_t,
                             0.45 + 0.05 * pos1_t)
-        # e_mid uses pos2
-        e_mid  = mf_tri(e, 0.25 - 0.05 * pos2_t, 
-                           0.50, 
+        e_mid  = mf_tri(e, 0.25 - 0.05 * pos2_t,
+                           0.50,
                            0.75 + 0.05 * pos2_t)
-        # e_high uses pos3
-        e_high = mf_trap(e, 0.55 - 0.1 * pos3_t, 
-                            0.75 - 0.05 * pos3_t, 
-                            1.0, 
-                            1.0)
-        
-        # Position-indexed membership functions for peak (p)
-        p_low  = mf_trap(p, 0.0, 
-                            0.0, 
-                            0.20 + 0.1 * pos1_t, 
-                            0.40 + 0.05 * pos1_t)
-        p_mid  = mf_tri(p, 0.25 - 0.1 * pos2_t, 
-                           0.50, 
-                           0.75 + 0.1 * pos2_t)
-        p_high = mf_trap(p, 0.60 - 0.1 * pos3_t, 
-                            0.80 - 0.05 * pos3_t, 
-                            1.0, 
-                            1.0)
-        
-        # Position-indexed membership functions for boost (b)
-        b_low  = mf_trap(b, 0.0, 
-                            0.0, 
-                            0.20 + 0.15 * pos1_t, 
-                            0.45 + 0.1 * pos1_t)
-        b_mid  = mf_tri(b, 0.25 - 0.1 * pos2_t, 
-                           0.50 + 0.05 * pos2_t, 
-                           0.75 + 0.05 * pos2_t)
-        b_high = mf_trap(b, 0.55 - 0.15 * pos3_t, 
-                            0.80 - 0.1 * pos3_t, 
-                            1.0, 
-                            1.0)
-        
-        # Position-indexed membership for aesthetic flow (a)
-        # Uses average position of trigram
-        avg_pos = (pos1_t + pos2_t + pos3_t) / 3.0
-        a_high = mf_trap(a, 0.5 - 0.1 * avg_pos, 
-                            0.7 - 0.05 * avg_pos, 
-                            1.0, 
+        e_high = mf_trap(e, 0.55 - 0.1 * pos3_t,
+                            0.75 - 0.05 * pos3_t,
+                            1.0,
                             1.0)
 
-        # Fuzzy rules (unchanged)
+        p_low  = mf_trap(p, 0.0,
+                            0.0,
+                            0.20 + 0.1 * pos1_t,
+                            0.40 + 0.05 * pos1_t)
+        p_mid  = mf_tri(p, 0.25 - 0.1 * pos2_t,
+                           0.50,
+                           0.75 + 0.1 * pos2_t)
+        p_high = mf_trap(p, 0.60 - 0.1 * pos3_t,
+                            0.80 - 0.05 * pos3_t,
+                            1.0,
+                            1.0)
+
+        b_low  = mf_trap(b, 0.0,
+                            0.0,
+                            0.20 + 0.15 * pos1_t,
+                            0.45 + 0.1 * pos1_t)
+        b_mid  = mf_tri(b, 0.25 - 0.1 * pos2_t,
+                           0.50 + 0.05 * pos2_t,
+                           0.75 + 0.05 * pos2_t)
+        b_high = mf_trap(b, 0.55 - 0.15 * pos3_t,
+                            0.80 - 0.1 * pos3_t,
+                            1.0,
+                            1.0)
+
+        avg_pos = (pos1_t + pos2_t + pos3_t) / 3.0
+        a_high = mf_trap(a, 0.5 - 0.1 * avg_pos,
+                            0.7 - 0.05 * avg_pos,
+                            1.0,
+                            1.0)
+
         w1 = tnorm_prod(e_high, p_low)
         w2 = tnorm_prod(e_mid, b_mid)
         w3 = snorm_max(p_high, b_high)
@@ -886,6 +950,7 @@ class Nodelet:
     energy: float
     narrative: str
 
+
 @dataclass
 class ModelState:
     nodelets: List[Nodelet]
@@ -899,11 +964,13 @@ class ModelState:
     problem_flow_by_token: Dict[str, float]
     centroid_computer: CentroidComputer  # NEW: Added centroid system
 
+
 @dataclass
 class PreparedCorpus:
     text: str
     tokens: List[str]
     state: ModelState
+
 
 class RadixLRUCache:
     def __init__(self, max_items: int = 25000):
@@ -925,6 +992,7 @@ class RadixLRUCache:
 
     def clear(self):
         self._od.clear()
+
 
 @dataclass
 class GenerationMetrics:
@@ -987,6 +1055,18 @@ class NeuroSymbolicGraphGenerator:
         self.centroid_boost_strength = float(centroid_boost_strength)
         self.centroid_enable = bool(centroid_enable)  # NEW
 
+    def get_sawtooth_modulation(self, current_step: int, total_steps: int, num_teeth: int = 8) -> float:
+        """
+        MASSIVE SAW WAVES: periodic probability modulation.
+        Linear ramp 0->1, then sharp reset.
+        Mimics filtration parameter growth in persistent homology.
+        """
+        if total_steps == 0:
+            return 0.0
+        period = max(1, total_steps // num_teeth)
+        phase = (current_step % period) / float(period)
+        return float(phase)
+
     def _pick_initial_context(self, lm: QuadgramLM, seed_words: List[str]) -> Tuple[str, str, str]:
         sw = [t for t in seed_words if re.match(r"^[a-z][a-z0-9_'-]*$", t) and t not in COGNITIVE_TOKENS]
         if len(sw) >= 3: return (sw[-3], sw[-2], sw[-1])
@@ -1000,16 +1080,15 @@ class NeuroSymbolicGraphGenerator:
         flow_by_token = compute_problem_flow_by_token(tokens)
         lm = QuadgramLM(add_k=self.lm_add_k)
         lm.ingest(tokens)
-        
-        # NEW: Compute semantic centroids for vocabulary (OPTIMIZED)
+
         if progress:
             progress(0.1, desc="Computing semantic centroids...")
         centroid_computer = CentroidComputer(max_neighbors=30, max_vocab_size=1000)
         centroid_computer.compute_all_centroids(tokens, freq_dict=lm.uni, progress=progress)
-        
+
         if progress:
             progress(0.2, desc="Building token boosts...")
-        
+
         token_boost: Dict[str, float] = {}
         for tok, boost_val in COGNITIVE_TOKENS.items():
             token_boost[tok] = boost_val
@@ -1073,74 +1152,75 @@ class NeuroSymbolicGraphGenerator:
         if self.hemi_enable: self.hemi.reset()
         return PreparedCorpus(text=text, tokens=tokens, state=state)
 
-    def _compute_abstract_coinage_boost(self, cand: List[str], w1: str, w2: str, w3: str, 
+    def _compute_abstract_coinage_boost(self, cand: List[str], w1: str, w2: str, w3: str,
                                        prep: PreparedCorpus, creativity: float) -> torch.Tensor:
-        """Boost tokens based on sophistication and natural novelty"""
         device = prep.state.activator.emb.weight.device
         boost = torch.zeros(len(cand), dtype=torch.float32, device=device)
-        
-        # Moderate complexity boost for natural sophistication
+
         for i, word in enumerate(cand):
-            # Favor moderately complex words (natural vocabulary)
             if 5 <= len(word) <= 9:
                 boost[i] += 0.2 * creativity
             elif len(word) >= 10:
-                boost[i] += 0.15 * creativity  # Don't over-favor extremely long words
-            
-            # Modest rarity boost (prefer less common but not obscure)
+                boost[i] += 0.15 * creativity
+
             freq = prep.state.lm.uni.get(word, 0)
             if freq > 0 and prep.state.lm.total > 0:
                 normalized_freq = freq / prep.state.lm.total
-                # Sweet spot: not too common, not too rare
                 if 0.0001 < normalized_freq < 0.01:
                     rarity_score = 1.0 - (normalized_freq / 0.01)
                     boost[i] += 0.25 * rarity_score * creativity
                 elif normalized_freq <= 0.0001:
-                    boost[i] += 0.15 * creativity  # Very rare words get moderate boost
-            
-            # Encourage natural semantic connections (moderate novelty)
+                    boost[i] += 0.15 * creativity
+
             pair = SymbolicPair.from_tokens(w3, word)
-            # Sweet spot: related but not too similar
             if 0.3 < pair.harmony < 0.7:
-                novelty = abs(pair.harmony - 0.5) / 0.2  # Peak at 0.5
+                novelty = abs(pair.harmony - 0.5) / 0.2
                 boost[i] += 0.2 * (1.0 - novelty) * creativity
-        
+
         return boost
 
-    def _compute_trigram_positions(self, w1: str, w2: str, w3: str, 
+    def _compute_trigram_positions(self, w1: str, w2: str, w3: str,
                                    prep: PreparedCorpus) -> Tuple[float, float, float]:
-        """Compute normalized position indexes for trigram based on vocab frequency"""
         vocab_size = len(prep.state.lm.vocab)
         if vocab_size == 0:
             return (0.0, 0.5, 1.0)
-        
-        # Get frequency ranks (lower rank = more common)
+
         def get_position(word: str) -> float:
             freq = prep.state.lm.uni.get(word, 0)
             if freq == 0:
-                return 1.0  # Unknown words get highest position
-            # Sort all words by frequency to get rank
+                return 1.0
             sorted_words = sorted(prep.state.lm.uni.items(), key=lambda x: -x[1])
             rank = next((i for i, (w, _) in enumerate(sorted_words) if w == word), vocab_size)
-            # Normalize to [0, 1]
             return rank / max(1, vocab_size)
-        
+
         pos1 = get_position(w1)
         pos2 = get_position(w2)
         pos3 = get_position(w3)
-        
+
         return (pos1, pos2, pos3)
 
     def _final_probs(self, prep: PreparedCorpus, w1: str, w2: str, w3: str,
                      x_pos: torch.Tensor, allow_cache: bool = True,
                      abstract_coinage_mode: bool = False,
-                     coinage_creativity: float = 0.8) -> Tuple[List[str], torch.Tensor, torch.Tensor]:
-        cache_ok = allow_cache and (not x_pos.requires_grad) and (x_pos.numel() == 1) and (not abstract_coinage_mode)
+                     coinage_creativity: float = 0.8,
+                     current_step: int = 0,    # NEW: for saw wave
+                     total_steps: int = 200    # NEW
+                     ) -> Tuple[List[str], torch.Tensor, torch.Tensor]:
+
+        # Note: Cache key now also depends on step phase if we really want full correctness,
+        # but to keep cache effective we skip saw-wave in key and just inject noise post-cache?
+        # NO, saw wave is a strong modulation. We must disable cache or include phase in key.
+        # Let's disable cache for max saw-wave effect.
+        
+        # cache_ok = allow_cache and (not x_pos.requires_grad) and (x_pos.numel() == 1) and (not abstract_coinage_mode)
+        # DISABLE CACHE TO FORCE SAW WAVE UPDATES
+        cache_ok = False 
+        
         key = None
-        if cache_ok:
-            key = (self.cache_version, w1, w2, w3, float(x_pos.item()))
-            cached = self.cache.get(key)
-            if cached is not None: return cached
+        # if cache_ok:
+        #    key = (self.cache_version, w1, w2, w3, float(x_pos.item()))
+        #    cached = self.cache.get(key)
+        #    if cached is not None: return cached
 
         cand, base_probs = prep.state.lm.next_distribution(w1, w2, w3)
         base_p = base_probs.to(dtype=torch.float32)
@@ -1157,29 +1237,24 @@ class NeuroSymbolicGraphGenerator:
         x_pos = x_pos.to(device=device, dtype=torch.float32).clamp(0.0, 1.0)
         boosts = torch.tensor([prep.state.token_boost.get(w, 0.0) for w in cand], dtype=torch.float32, device=device)
 
-        # Pairwise activator boost
         w_pair, _vec4 = prep.state.activator.forward_weight(w3, cand, x_pos=x_pos)
         w_pair = w_pair / (w_pair.mean() + 1e-12)
         boosts = boosts + self.pairwise_strength * w_pair
 
-        # NEW: CENTROID BOOST - Pull toward semantically related tokens
+        # CENTROID BOOST (topo-spiky)
         centroid_boost = prep.state.centroid_computer.get_centroid_boost(
             current_token=w3,
             candidate_tokens=cand,
             boost_strength=self.centroid_boost_strength
         )
         centroid_boost_t = torch.tensor(centroid_boost, dtype=torch.float32, device=device)
-        boosts = boosts + centroid_boost_t  # Add centroid semantic gravity
+        boosts = boosts + centroid_boost_t
 
-        # NARRATIVE MODE MODIFICATIONS
         if abstract_coinage_mode:
-            # Add refined vocabulary boost
             creative_boost = self._compute_abstract_coinage_boost(
                 cand, w1, w2, w3, prep, coinage_creativity
             )
             boosts = boosts + creative_boost
-            
-            # Moderate temperature increase for natural variety
             effective_temp_mult = 1.2
         else:
             effective_temp_mult = 1.0
@@ -1195,27 +1270,33 @@ class NeuroSymbolicGraphGenerator:
         base_flow_t = torch.tensor(base_flow, dtype=torch.float32, device=device).clamp(0.0, 1.0)
         aesthetic_flow01 = (base_flow_t * (0.5 + 0.5 * x_pos)).clamp(0.0, 1.0)
 
-        # Compute trigram position indexes
         trigram_positions = self._compute_trigram_positions(w1, w2, w3, prep)
 
-        g = self.fuzzy_ctl(entropy01, peak01, boost01, aesthetic_flow01, 
+        g = self.fuzzy_ctl(entropy01, peak01, boost01, aesthetic_flow01,
                           osculator_strength=self.osculator_strength,
                           trigram_positions=trigram_positions)
         effective_steer = self.base_steer * g
         effective_temp = self.base_temp * (1.2 - 0.7 * g) * effective_temp_mult
 
         potentials = torch.log(base_p.to(device=device).clamp_min(1e-12)) + effective_steer * boosts
+        
+        # MASSIVE SAW WAVES: Inject saw modulation
+        saw_val = self.get_sawtooth_modulation(current_step, total_steps, num_teeth=8)
+        # Exponential spike: saw_val 0->1 creates massive sharpening
+        saw_spike = torch.tensor(saw_val * 8.0, device=device) 
+        potentials = potentials * (1.0 + saw_spike)
+
         potentials = potentials / torch.clamp(effective_temp, min=1e-6)
         final_probs = F.softmax(potentials, dim=-1)
 
         hemi_pen = torch.tensor(0.0, device=device, dtype=final_probs.dtype)
-        if self.hemi_enable and not abstract_coinage_mode:  # Disable hemi for more creativity
+        if self.hemi_enable and not abstract_coinage_mode:
             final_probs, hemi_pen = self.hemi.apply(cand, final_probs)
-        
+
         flow_vec = torch.tensor([prep.state.problem_flow_by_token.get(w, 0.0) for w in cand], dtype=torch.float32, device=device).clamp(0.0, 1.0)
 
         out = (cand, final_probs, flow_vec)
-        if cache_ok and key is not None: self.cache.put(key, (cand, final_probs.detach(), flow_vec.detach()))
+        # No caching due to saw wave step dependency
         return out
 
     @torch.no_grad()
@@ -1230,9 +1311,8 @@ class NeuroSymbolicGraphGenerator:
         w1, w2, w3 = self._pick_initial_context(prep.state.lm, seed_toks)
         device = prep.state.activator.emb.weight.device
         total_steps = int(max_tokens)
-        
+
         if abstract_coinage_mode:
-            # Professional narrative voices with natural flow
             role_definitions = [
                 ("Observer", 0.0, 0.2, "noticing", ["observe", "notice", "perceive", "see", "consider"]),
                 ("Questioner", 0.15, 0.35, "inquiring", ["perhaps", "might", "could", "what", "whether"]),
@@ -1242,7 +1322,6 @@ class NeuroSymbolicGraphGenerator:
                 ("Reflector", 0.75, 1.0, "concluding", ["ultimately", "thus", "suggests", "reveals", "illuminates"]),
             ]
         else:
-            # Original problem-solving roles
             role_definitions = [
                 ("Problem Poser", 0.0, 0.25, "questioning", ["?", "what", "how", "why"]),
                 ("Analyzer", 0.2, 0.45, "analyzing", ["because", "consider", "examine", "observe"]),
@@ -1250,17 +1329,17 @@ class NeuroSymbolicGraphGenerator:
                 ("Critic", 0.5, 0.75, "critiquing", ["however", "but", "issue", "problem"]),
                 ("Synthesizer", 0.7, 1.0, "synthesizing", ["therefore", "thus", "overall", "combining"]),
             ]
-        
+
         speaker_roles = []
         for i in range(int(num_speakers)):
             role_idx = i % len(role_definitions)
             speaker_roles.append(role_definitions[role_idx])
-        
+
         conversation: List[Tuple[str, str, List[str], float]] = []
         current_speaker_idx = 0
         current_turn_tokens: List[str] = []
         alpha_count_turn = 0
-        
+
         role_token_counts = {role[0]: 0 for role in speaker_roles}
         role_flow_sums = {role[0]: 0.0 for role in speaker_roles}
         role_flow_counts = {role[0]: 0 for role in speaker_roles}
@@ -1270,8 +1349,7 @@ class NeuroSymbolicGraphGenerator:
         assertion_count = 0
         aesthetic_flows = []
         current_sentence_length = 0
-        
-        # Abstract coinage tracking
+
         prev_tokens = [w1, w2, w3]
         conceptual_jumps = 0
         unique_pairs = set()
@@ -1281,20 +1359,22 @@ class NeuroSymbolicGraphGenerator:
             progress = i / max(1, total_steps)
             global_x = start_x + (1.0 - start_x) * progress
             role_x_bias = (x_min + x_max) / 2.0
-            
+
             if target_flow is not None:
                 curr_x_val = target_flow
             else:
                 curr_x_val = 0.7 * global_x + 0.3 * role_x_bias
                 curr_x_val = max(x_min, min(x_max, curr_x_val))
-            
+
             x = torch.tensor(float(curr_x_val), dtype=torch.float32, device=device)
             cand, probs, flow_vec = self._final_probs(
-                prep, w1, w2, w3, x_pos=x, allow_cache=not abstract_coinage_mode,
+                prep, w1, w2, w3, x_pos=x, allow_cache=False,
                 abstract_coinage_mode=abstract_coinage_mode,
-                coinage_creativity=coinage_creativity
+                coinage_creativity=coinage_creativity,
+                current_step=i,    # Pass current step for saw wave
+                total_steps=total_steps
             )
-            
+
             if keywords and not abstract_coinage_mode:
                 keyword_boost = torch.zeros_like(probs)
                 for idx, c in enumerate(cand):
@@ -1304,19 +1384,16 @@ class NeuroSymbolicGraphGenerator:
                     keyword_boost[idx] += 0.2 * flow_match
                 probs = probs * torch.exp(keyword_boost)
                 probs = probs / (probs.sum() + 1e-12)
-            
-            # Sample from distribution
+
             p = probs.detach().cpu().numpy()
             p = p / (p.sum() + 1e-12)
             idx = rng.choice(len(cand), p=p)
             tok = cand[idx]
 
-            # Track abstract metrics
             if abstract_coinage_mode:
-                # Track conceptual jumps (semantic distance)
                 if len(prev_tokens) >= 3:
                     pair = SymbolicPair.from_tokens(prev_tokens[-1], tok)
-                    if pair.harmony < 0.4:  # Low harmony = conceptual jump
+                    if pair.harmony < 0.4:
                         conceptual_jumps += 1
                 unique_pairs.add((prev_tokens[-1] if prev_tokens else "", tok))
                 prev_tokens.append(tok)
@@ -1342,38 +1419,36 @@ class NeuroSymbolicGraphGenerator:
 
             w1, w2, w3 = w2, w3, tok
             if re.match(r"[A-Za-z]", tok): alpha_count_turn += 1
-            
+
             should_switch = False
-            if tok in [".", "!", "?"] and alpha_count_turn >= min(tokens_per_turn * 0.6, 20): 
+            if tok in [".", "!", "?"] and alpha_count_turn >= min(tokens_per_turn * 0.6, 20):
                 should_switch = True
-            elif len(current_turn_tokens) >= tokens_per_turn * 1.5: 
+            elif len(current_turn_tokens) >= tokens_per_turn * 1.5:
                 should_switch = True
             elif len(current_turn_tokens) >= tokens_per_turn and alpha_count_turn > 15:
-                if tok in [",", ";"] or (i > 0 and rng.random() < 0.3): 
+                if tok in [",", ";"] or (i > 0 and rng.random() < 0.3):
                     should_switch = True
-            
+
             if should_switch and current_turn_tokens:
                 conversation.append((role_name, mode, list(current_turn_tokens), role_x_bias))
                 current_speaker_idx = (current_speaker_idx + 1) % num_speakers
                 current_turn_tokens = []
                 alpha_count_turn = 0
-        
+
         if current_turn_tokens:
             role_name, x_min, x_max, mode, keywords = speaker_roles[current_speaker_idx]
             role_x_bias = (x_min + x_max) / 2.0
             conversation.append((role_name, mode, current_turn_tokens, role_x_bias))
 
         role_avg_flow = {role: role_flow_sums[role] / role_flow_counts[role] if role_flow_counts[role] > 0 else 0.0 for role in role_token_counts.keys()}
-        
-        # Calculate abstract density (avg word length, rarity)
+
         all_tokens = []
         for _, _, tokens, _ in conversation:
             all_tokens.extend(tokens)
         abstract_density = sum(len(t) for t in all_tokens if re.match(r"[A-Za-z]", t)) / max(1, len(all_tokens))
-        
-        # Get centroid statistics
+
         centroid_stats = prep.state.centroid_computer.get_summary_stats()
-        
+
         metrics = GenerationMetrics(
             role_token_counts=role_token_counts,
             role_avg_flow=role_avg_flow,
@@ -1386,30 +1461,28 @@ class NeuroSymbolicGraphGenerator:
             abstract_density=abstract_density,
             conceptual_jumps=conceptual_jumps,
             unique_combinations=len(unique_pairs),
-            centroid_stats=centroid_stats  # NEW
+            centroid_stats=centroid_stats
         )
-        
+
         text = self.format_conversation(conversation, problem_solving_mode, abstract_coinage_mode)
         return text, metrics
 
-    def format_conversation(self, conversation: List[Tuple[str, str, List[str], float]], 
+    def format_conversation(self, conversation: List[Tuple[str, str, List[str], float]],
                           problem_solving_mode: bool, abstract_coinage_mode: bool = False) -> str:
         lines = []
-        
+
         if abstract_coinage_mode:
-            # Clean, professional narrative format
             lines.append("")
         elif problem_solving_mode:
             lines.append("=" * 60)
             lines.append("SINGLE-ENTITY PROBLEM SOLVING SESSION")
             lines.append("=" * 60)
             lines.append("")
-        
+
         for role, mode, tokens, x_bias in conversation:
             text = detokenize(tokens)
             if text.strip():
                 if abstract_coinage_mode:
-                    # Simple, readable format
                     lines.append(f"**{role}**")
                     lines.append(f"{text}")
                     lines.append("")
@@ -1420,14 +1493,14 @@ class NeuroSymbolicGraphGenerator:
                 else:
                     lines.append(f"{role}: {text}")
                     lines.append("")
-        
+
         if abstract_coinage_mode:
             lines.append("")
         elif problem_solving_mode:
             lines.append("=" * 60)
             lines.append("END OF SESSION")
             lines.append("=" * 60)
-        
+
         return "\n".join(lines)
 
 
@@ -1443,6 +1516,7 @@ def _resolve_gradio_file_to_path(infile) -> str:
     if hasattr(infile, "path"): return str(infile.path)
     raise ValueError(f"Unsupported infile type: {type(infile)}")
 
+
 def _load_corpus(use_hf: bool, hf_dataset: str, hf_split: str, hf_max_rows: int, text_file) -> str:
     if use_hf:
         ds = load_dataset(hf_dataset, split=hf_split)
@@ -1456,46 +1530,45 @@ def _load_corpus(use_hf: bool, hf_dataset: str, hf_split: str, hf_max_rows: int,
         path = _resolve_gradio_file_to_path(text_file)
         return load_text(path)
 
-def run_session(use_hf, hf_dataset, hf_split, hf_max_rows, text_file, 
-                prompt, seed, maxtokens, num_speakers, 
-                steer, focus, pairwise, abstract_mode, creativity, centroid_strength, 
+
+def run_session(use_hf, hf_dataset, hf_split, hf_max_rows, text_file,
+                prompt, seed, maxtokens, num_speakers,
+                steer, focus, pairwise, abstract_mode, creativity, centroid_strength,
                 progress=gr.Progress()):
     try:
         progress(0.0, desc="Loading corpus...")
         corpus_text = _load_corpus(bool(use_hf), str(hf_dataset), str(hf_split), int(hf_max_rows), text_file)
-        
+
         gen = NeuroSymbolicGraphGenerator(
-            steer_strength=float(steer), focus_strength=float(focus), 
-            pairwise_strength=float(pairwise), activator_boot_epochs=15, 
-            hemi_enable=not abstract_mode,  # Disable hemi for abstract mode
-            centroid_boost_strength=float(centroid_strength)  # NEW PARAMETER
+            steer_strength=float(steer), focus_strength=float(focus),
+            pairwise_strength=float(pairwise), activator_boot_epochs=15,
+            hemi_enable=not abstract_mode,
+            centroid_boost_strength=float(centroid_strength)
         )
-        
+
         progress(0.05, desc="Preparing corpus...")
         prep = gen.prepare_corpus(corpus_text, progress=progress)
-        
+
         progress(0.5, desc="Generating Session...")
         text, metrics = gen.generate(
-            prep, str(prompt), start_x=0.0, max_tokens=int(maxtokens), 
+            prep, str(prompt), start_x=0.0, max_tokens=int(maxtokens),
             seed=int(seed), num_speakers=int(num_speakers), tokens_per_turn=60,
             problem_solving_mode=not abstract_mode,
             abstract_coinage_mode=bool(abstract_mode),
             coinage_creativity=float(creativity)
         )
-        
-        # Stats String
+
         stats = []
         stats.append(f"Total Tokens: {metrics.total_tokens}")
         stats.append(f"Average Flow: {metrics.avg_aesthetic_flow:.3f}")
-        
+
         if abstract_mode:
             stats.append(f"Abstract Density: {metrics.abstract_density:.3f}")
             stats.append(f"Conceptual Jumps: {metrics.conceptual_jumps}")
             stats.append(f"Unique Combinations: {metrics.unique_combinations}")
         else:
             stats.append(f"Questions: {metrics.question_count}, Assertions: {metrics.assertion_count}")
-        
-        # NEW: Centroid statistics
+
         if metrics.centroid_stats:
             stats.append(f"\nCentroid Statistics:")
             stats.append(f"  Total centroids: {metrics.centroid_stats.get('total_centroids', 0)}")
@@ -1504,17 +1577,20 @@ def run_session(use_hf, hf_dataset, hf_split, hf_max_rows, text_file,
             high_coh = metrics.centroid_stats.get('high_coherence_tokens', [])
             if high_coh:
                 stats.append(f"  High coherence tokens: {', '.join(high_coh[:5])}")
-        
+            topo_hints = metrics.centroid_stats.get('topology_hint_tokens', [])
+            if topo_hints:
+                stats.append(f"  Topology hint tokens: {', '.join(topo_hints[:8])}")
+
         stats.append("\nRole Breakdown:")
         for r, c in metrics.role_token_counts.items():
             avg_flow = metrics.role_avg_flow.get(r, 0.0)
             stats.append(f"  {r}: {c} tokens (flow: {avg_flow:.3f})")
-        
+
         if metrics.keyword_usage:
             stats.append("\nTop Keywords:")
             for kw, count in metrics.keyword_usage.most_common(5):
                 stats.append(f"  {kw}: {count}")
-        
+
         return text, "\n".join(stats)
 
     except Exception as e:
@@ -1522,28 +1598,33 @@ def run_session(use_hf, hf_dataset, hf_split, hf_max_rows, text_file,
         traceback.print_exc()
         return f"Error: {str(e)}", ""
 
+
 def toggle_corpus_source(use_hf_val):
     return (
-        gr.update(visible=use_hf_val), # hf_dataset
-        gr.update(visible=use_hf_val), # hf_split
-        gr.update(visible=use_hf_val), # hf_max_rows
-        gr.update(visible=not use_hf_val), # text_file
-        gr.update(visible=not use_hf_val), # file_info
+        gr.update(visible=use_hf_val),      # hf_dataset
+        gr.update(visible=use_hf_val),      # hf_split
+        gr.update(visible=use_hf_val),      # hf_max_rows
+        gr.update(visible=not use_hf_val),  # text_file
+        gr.update(visible=not use_hf_val),  # file_info
     )
+
 
 def toggle_mode(abstract_val):
     """Show/hide creativity slider based on abstract mode"""
     return gr.update(visible=abstract_val)
 
+
 def build_app():
-    with gr.Blocks(title="NeuroSymbolic V7.0 - Centroid of Meaning", theme=gr.themes.Soft()) as demo:
+    with gr.Blocks(title="NeuroSymbolic V7.2 - Topology Saw Waves", theme=gr.themes.Soft()) as demo:
         gr.Markdown("""
-        # NeuroSymbolic V7.0 - Narrative Generation WITH CENTROID OF MEANING
+        # NeuroSymbolic V7.2 - Narrative Generation WITH MASSIVE SAW WAVES
         Generate flowing narratives with sophisticated language and **semantic coherence**
-        
-        **NEW**: Each token has a computed semantic centroid that guides generation toward related concepts!
+
+        **NEW**: 
+        - **Topology-Spiky Centroids**: Gravity pulls toward algebraic topology (homology, Betti numbers).
+        - **Massive Saw Waves**: Probability potentials oscillate wildly, simulating filtration steps!
         """)
-        
+
         with gr.Row():
             with gr.Column(scale=1):
                 gr.Markdown("### Corpus Source")
@@ -1553,22 +1634,22 @@ def build_app():
                 hf_max_rows = gr.Slider(100, 5000, value=2000, step=100, label="Max rows", visible=True)
                 text_file = gr.File(label="Upload Text File", file_types=[".txt", ".md"], visible=False)
                 file_info = gr.Markdown("Using entire file as corpus.", visible=False)
-                
-                use_hf.change(toggle_corpus_source, inputs=[use_hf], 
+
+                use_hf.change(toggle_corpus_source, inputs=[use_hf],
                             outputs=[hf_dataset, hf_split, hf_max_rows, text_file, file_info])
-                
+
                 gr.Markdown("### Generation Mode")
                 abstract_mode = gr.Checkbox(label="Narrative Story Mode", value=True)
-                creativity = gr.Slider(0.0, 1.0, value=0.7, step=0.05, label="Creative Language", 
+                creativity = gr.Slider(0.0, 1.0, value=0.7, step=0.05, label="Creative Language",
                                       info="Higher = more sophisticated vocabulary and novel phrasing", visible=True)
-                
+
                 abstract_mode.change(toggle_mode, inputs=[abstract_mode], outputs=[creativity])
-                
+
                 gr.Markdown("### Parameters")
                 seed = gr.Number(value=42, label="Seed")
                 maxtokens = gr.Slider(100, 1000, value=400, step=50, label="Tokens")
                 num_speakers = gr.Slider(2, 6, value=4, step=1, label="Narrative Voices")
-                
+
                 with gr.Accordion("Advanced", open=False):
                     steer = gr.Slider(0.5, 3, value=1.35, step=0.05, label="Steer strength")
                     focus = gr.Slider(0, 1, value=0.5, step=0.05, label="Focus strength")
@@ -1578,46 +1659,40 @@ def build_app():
 
             with gr.Column(scale=2):
                 prompt = gr.Textbox(
-                    label="Starting Prompt", 
-                    value="Consider the nature of understanding", 
+                    label="Starting Prompt",
+                    value="Consider the nature of understanding",
                     lines=2,
                     info="Opening phrase to begin the narrative"
                 )
                 btn = gr.Button("Generate Narrative", variant="primary", size="lg")
-                
+
                 output_text = gr.Textbox(label="Generated Narrative", lines=25, show_copy_button=True)
                 output_stats = gr.Textbox(label="Generation Statistics", lines=15)
 
         btn.click(
             run_session,
-            inputs=[use_hf, hf_dataset, hf_split, hf_max_rows, text_file, 
+            inputs=[use_hf, hf_dataset, hf_split, hf_max_rows, text_file,
                     prompt, seed, maxtokens, num_speakers, steer, focus, pairwise,
                     abstract_mode, creativity, centroid_strength],
             outputs=[output_text, output_stats]
         )
-        
+
         gr.Markdown("""
-        ### About Centroid of Meaning
-        
-        **NEW in V7.0**: Each token has a **semantic centroid** computed in 4D aesthetic space:
-        - **Harmony**: string similarity (edit distance)
-        - **Density**: combined token lengths
-        - **Momentum**: relative length change
-        - **Resonance**: hash-based variation
-        
-        During generation, tokens near the current token's centroid are **boosted**, creating:
-        - **Semantic coherence**: Maintains conceptual flow
-        - **Multi-scale semantics**: Local (pairwise) + global (centroid) relationships
-        - **Adaptive generation**: High-coherence tokens have stable centroids, low-coherence spread out
-        
-        Adjust **Centroid boost strength** to control:
-        - **High (0.5-0.8)**: Stay near current concept (tight semantic flow)
-        - **Medium (0.3-0.4)**: Balance coherence with exploration
-        - **Low (0.1-0.2)**: Allow more conceptual jumps
-        - **Zero**: Disable for maximum creativity
+        ### About Centroid of Meaning & Saw Waves
+
+        **Topology-Spiky Centroids**:
+        - Each token has a **semantic centroid** computed in 4D aesthetic space.
+        - **Spiky Bias**: Centroids now aggressively prefer algebraic topology terms (homology, Betti, filtration).
+        - **Problem Arguments**: Generated text will naturally drift toward topological data analysis concepts.
+
+        **Massive Saw Waves**:
+        - **Probability Modulation**: A sawtooth wave (0 -> 1 -> 0) multiplies the potentials.
+        - **Filtration Simulation**: As the wave ramps up, deterministic focus increases (high persistence).
+        - **Reset**: When the wave drops, entropy maximizes (birth of new features).
         """)
 
     return demo
+
 
 if __name__ == "__main__":
     demo = build_app()

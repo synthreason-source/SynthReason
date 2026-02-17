@@ -1,6 +1,6 @@
-
+#!/usr/bin/env python3
 """
-NeuroSymbolic-Coho v1.3  — ROLE SYSTEM FIX
+NeuroSymbolic-Coho v1.4  — HEMICONTINUITY
 ─────────────────────────────────────────────────────────────
 FIVE ROLE BUGS FIXED:
 
@@ -39,7 +39,7 @@ BUG 5 — Role keyword boost was missing from the logit vector.
 
 from __future__ import annotations
 import re, numpy as np
-from typing import Dict, List, Tuple, Set
+from typing import Dict, List, Tuple, Set, Optional
 import gradio as gr
 import torch, torch.nn.functional as F
 from datasets import load_dataset
@@ -161,6 +161,101 @@ def _assign_roles(n_voices: int) -> List[tuple]:
     return [ROLES[i % len(ROLES)] for i in range(n_voices)]
 
 
+# ══════════════════════════════════════════════════════════════
+#  HEMI-CONTINUITY
+#  Tracks probability mass flow between consecutive steps.
+#  Penalises tokens that suddenly enter or leave the top-K,
+#  and smooths the distribution with a blend of the previous step.
+#
+#  Upper violation: token appears in top-K this step but not last.
+#  Lower violation: token was in top-K last step but dropped out.
+#  Both violations contribute to hemi_penalty (diagnostic only).
+#  Smoothing: probs = (1-α)*probs + α*prev_probs  (renormalised).
+#  Penalty:   violating tokens get their probability scaled down.
+# ══════════════════════════════════════════════════════════════
+class HemiContinuity:
+    def __init__(self, top_k: int = 50, alpha: float = 0.1,
+                 penalty: float = 0.1):
+        """
+        top_k   : number of candidates to watch for violations
+        alpha   : smoothing weight for previous distribution (0 = off)
+        penalty : probability scale-down applied to violating tokens
+                  (0 = no penalty, 0.5 = halve their probability)
+        """
+        self.top_k   = max(1, int(top_k))
+        self.alpha   = float(alpha)
+        self.penalty = float(penalty)
+        self._reset_state()
+
+    def _reset_state(self) -> None:
+        self._prev_cands: List[str]      = []
+        self._prev_probs: Optional[torch.Tensor] = None
+        self._prev_index: Dict[str, int] = {}
+
+    def reset(self) -> None:
+        """Call at the start of each generate() and optionally on role switch."""
+        self._reset_state()
+
+    def apply(self, cands: List[str],
+              probs: torch.Tensor) -> Tuple[torch.Tensor, float]:
+        """
+        Apply hemi-continuity smoothing and violation penalty.
+        Returns (adjusted_probs, hemi_penalty_scalar).
+        On the very first call (no previous state) returns probs unchanged.
+        """
+        # ── First step: just store and pass through ───────────
+        if self._prev_probs is None:
+            self._prev_cands = list(cands)
+            self._prev_probs = probs.detach().clone()
+            self._prev_index = {w: i for i, w in enumerate(cands)}
+            return probs, 0.0
+
+        # ── Align previous probs onto the current candidate list ──
+        # Words that appeared last step but not this step are ignored.
+        # Words that appear this step but not last step get prev_prob = 0.
+        prev_on_curr = torch.zeros(len(cands), dtype=probs.dtype)
+        for i, w in enumerate(cands):
+            j = self._prev_index.get(w)
+            if j is not None and j < self._prev_probs.numel():
+                prev_on_curr[i] = self._prev_probs[j]
+
+        # ── Compute top-K masks ────────────────────────────────
+        k = min(self.top_k, len(cands))
+        curr_topk = torch.zeros(len(cands), dtype=torch.bool)
+        curr_topk[torch.topk(probs, k).indices] = True
+
+        prev_topk = torch.zeros(len(cands), dtype=torch.bool)
+        if prev_on_curr.sum() > 0:
+            prev_topk[torch.topk(prev_on_curr, k).indices] = True
+
+        # ── Violation masks ────────────────────────────────────
+        upper_viol = curr_topk & (~prev_topk)   # suddenly appeared
+        lower_viol = prev_topk & (~curr_topk)   # suddenly dropped out
+
+        hemi_penalty = float((probs[upper_viol].sum()
+                              + prev_on_curr[lower_viol].sum()).item())
+
+        # ── Penalty: scale down violating tokens ───────────────
+        if self.penalty > 0.0 and (upper_viol.any() or lower_viol.any()):
+            scale = torch.ones(len(cands), dtype=probs.dtype)
+            viol  = upper_viol | lower_viol
+            scale[viol] = max(0.0, 1.0 - self.penalty)
+            probs = probs * scale
+            probs = probs / (probs.sum() + 1e-12)
+
+        # ── Smoothing: blend with previous distribution ────────
+        if self.alpha > 0.0:
+            probs = (1.0 - self.alpha) * probs + self.alpha * prev_on_curr
+            probs = probs / (probs.sum() + 1e-12)
+
+        # ── Store for next step ────────────────────────────────
+        self._prev_cands = list(cands)
+        self._prev_probs = probs.detach().clone()
+        self._prev_index = {w: i for i, w in enumerate(cands)}
+
+        return probs, hemi_penalty
+
+
 def _saw_temp(step: int, total: int, teeth: int = 8, base: float = 0.9) -> float:
     period = max(1, total // teeth)
     phase  = (step % period) / period
@@ -199,7 +294,7 @@ def _detok(toks: List[str]) -> str:
         else:
             out.append(t)
     s = ' '.join(out)
-    return re.sub(r'([a-z])', lambda m: m.group(1), s)
+    return re.sub(r'(^|[.!?] )([a-z])', lambda m: m.group(1) + m.group(2).upper(), s)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -208,43 +303,58 @@ def _detok(toks: List[str]) -> str:
 def generate(cc: CochainComplex, prompt: str, n_tokens: int = 400, seed: int = 42,
              n_voices: int = 4, steer: float = 1.2, h1_str: float = 0.4,
              prompt_strength: float = 0.6, role_strength: float = 0.5,
-             tokens_per_role: int = 60) -> str:
+             tokens_per_role: int = 60,
+             hemi_enable: bool = True, hemi_alpha: float = 0.1,
+             hemi_top_k: int = 50, hemi_penalty: float = 0.1,
+             hemi_reset_on_role: bool = True) -> Tuple[str, Dict]:
     """
-    role_strength   : logit boost for the current role's keyword set (BUG 1+5 fix)
-    tokens_per_role : guaranteed max alpha-token count before forced role switch (BUG 2 fix)
+    Returns (text, stats_dict) where stats_dict includes hemi diagnostics.
+
+    hemi_enable        : enable HemiContinuity smoothing + violation penalty
+    hemi_alpha         : blend weight for previous distribution (0=off, 0.1=default)
+    hemi_top_k         : top-K window used for violation detection
+    hemi_penalty       : scale-down applied to violating tokens (0=off, 0.1=default)
+    hemi_reset_on_role : reset hemi state on each role switch (distinct voice contexts)
     """
     rng  = np.random.default_rng(seed)
     toks = re.findall(r'[a-z][a-z0-9\'-]*', prompt.lower())
     prompt_words = _parse_prompt_words(prompt, cc)
     w1, w2, w3   = _seed_ctx(cc, toks)
 
-    # BUG 4 FIX: cycle through all 6 roles
     roles = _assign_roles(n_voices)
+
+    # Initialise HemiContinuity
+    hemi = HemiContinuity(top_k=hemi_top_k, alpha=hemi_alpha, penalty=hemi_penalty)
 
     turns: List[Tuple[str, List[str]]] = []
     cur:   List[str] = []
-    ri         = 0
-    alpha_count = 0          # BUG 2 FIX: count only alphabetic tokens
+    ri          = 0
+    alpha_count = 0
+    total_hemi_penalty = 0.0
+    hemi_steps         = 0
 
     for step in range(n_tokens):
-        role_name, keywords, temp_mult, steer_mult = roles[ri]  # BUG 1 FIX: unpack keywords
+        role_name, keywords, temp_mult, steer_mult = roles[ri]
 
         cands, probs = cc.next_dist(w1, w2, w3)
 
-        # Build logits with all biases
         logits = torch.log(probs.clamp(1e-12))
-        logits = logits + (steer * steer_mult) * cc.h1_boost(cands, h1_str)   # BUG 3: per-role steer
+        logits = logits + (steer * steer_mult) * cc.h1_boost(cands, h1_str)
         if prompt_words:
             logits = logits + cc.prompt_bias(cands, prompt_words, prompt_strength)
-        # BUG 1+5 FIX: apply role keyword boost every step
         logits = logits + cc.role_boost(cands, keywords, role_strength)
 
         probs = F.softmax(logits, dim=-1)
         probs = _stop_gate(cands, probs)
 
-        # BUG 3 FIX: per-role temperature
         temp  = _saw_temp(step, n_tokens) * temp_mult
         probs = F.softmax(torch.log(probs.clamp(1e-12)) / max(temp, 0.1), dim=-1)
+
+        # ── HemiContinuity ─────────────────────────────────────
+        if hemi_enable:
+            probs, hpen = hemi.apply(cands, probs)
+            total_hemi_penalty += hpen
+            hemi_steps += 1
 
         p   = probs.numpy(); p /= p.sum()
         tok = cands[rng.choice(len(cands), p=p)]
@@ -254,7 +364,6 @@ def generate(cc: CochainComplex, prompt: str, n_tokens: int = 400, seed: int = 4
         if re.match(r'[a-zA-Z]', tok):
             alpha_count += 1
 
-        # BUG 2 FIX: switch on sentence-end OR max turn length
         end_of_sentence = tok in '.!?' and alpha_count >= 20
         max_turn_reached = alpha_count >= tokens_per_role
         soft_break = (tok in ',;' and alpha_count >= tokens_per_role // 2
@@ -264,11 +373,25 @@ def generate(cc: CochainComplex, prompt: str, n_tokens: int = 400, seed: int = 4
             turns.append((role_name, cur[:]))
             cur = []; alpha_count = 0
             ri = (ri + 1) % n_voices
+            # Optionally give each role a fresh probability context
+            if hemi_enable and hemi_reset_on_role:
+                hemi.reset()
 
     if cur:
         turns.append((roles[ri][0], cur))
 
-    return "\n".join(f"**{role}**\n{_detok(tks)}\n" for role, tks in turns)
+    text = "\n".join(f"**{role}**\n{_detok(tks)}\n" for role, tks in turns)
+    hemi_stats = {
+        "enabled":       hemi_enable,
+        "alpha":         hemi_alpha,
+        "top_k":         hemi_top_k,
+        "penalty":       hemi_penalty,
+        "reset_on_role": hemi_reset_on_role,
+        "avg_penalty":   total_hemi_penalty / max(1, hemi_steps),
+        "total_penalty": total_hemi_penalty,
+        "steps":         hemi_steps,
+    }
+    return text, hemi_stats
 
 
 # ══════════════════════════════════════════════════════════════
@@ -285,7 +408,7 @@ def load_corpus(use_hf: bool, dataset: str, split: str, maxrows: int, file) -> s
     return open(path, encoding='utf-8', errors='replace').read()
 
 def tokenize(text: str) -> List[str]:
-    return [t.lower() for t in text.split()]
+    return [t.lower() for t in re.findall(r'[A-Za-z][A-Za-z0-9\'-]*', text)]
 
 
 # ══════════════════════════════════════════════════════════════
@@ -294,6 +417,7 @@ def tokenize(text: str) -> List[str]:
 def run(use_hf, dataset, split, maxrows, file, prompt,
         seed, ntok, voices, steer, h1_str, prompt_strength,
         role_strength, tokens_per_role,
+        hemi_enable, hemi_alpha, hemi_top_k, hemi_penalty, hemi_reset_on_role,
         progress=gr.Progress()):
     progress(0.1, desc="Loading corpus…")
     text = load_corpus(use_hf, dataset, split, maxrows, file)
@@ -307,14 +431,30 @@ def run(use_hf, dataset, split, maxrows, file, prompt,
     toks = re.findall(r'[a-z][a-z0-9\'-]*', prompt.lower())
     w1,w2,w3 = _seed_ctx(cc, toks)
 
-    roles_used = _assign_roles(int(voices))
+    roles_used   = _assign_roles(int(voices))
     role_summary = " → ".join(f"{r[0]}(t×{r[2]},s×{r[3]})" for r in roles_used)
 
-    out = generate(cc, prompt, n_tokens=int(ntok), seed=int(seed),
-                   n_voices=int(voices), steer=float(steer), h1_str=float(h1_str),
-                   prompt_strength=float(prompt_strength),
-                   role_strength=float(role_strength),
-                   tokens_per_role=int(tokens_per_role))
+    out, hemi_stats = generate(
+        cc, prompt, n_tokens=int(ntok), seed=int(seed),
+        n_voices=int(voices), steer=float(steer), h1_str=float(h1_str),
+        prompt_strength=float(prompt_strength),
+        role_strength=float(role_strength),
+        tokens_per_role=int(tokens_per_role),
+        hemi_enable=bool(hemi_enable),
+        hemi_alpha=float(hemi_alpha),
+        hemi_top_k=int(hemi_top_k),
+        hemi_penalty=float(hemi_penalty),
+        hemi_reset_on_role=bool(hemi_reset_on_role),
+    )
+
+    hemi_line = (
+        f"HemiContinuity: ON  α={hemi_stats['alpha']}  "
+        f"top_k={hemi_stats['top_k']}  penalty={hemi_stats['penalty']}  "
+        f"reset_on_role={hemi_stats['reset_on_role']}  "
+        f"avg_violation={hemi_stats['avg_penalty']:.4f}"
+        if hemi_stats["enabled"]
+        else "HemiContinuity: OFF"
+    )
 
     stats = "\n".join([
         f"Vocab: {len(cc.vocab)}  |  C¹ bigrams: {len(cc.C[1])}",
@@ -322,6 +462,7 @@ def run(use_hf, dataset, split, maxrows, file, prompt,
         f"Prompt words active: {sorted(prompt_words) or '—'}",
         f"Prompt words OOV: {sorted(oov) or '—'}",
         f"Roles in use: {role_summary}",
+        hemi_line,
         f"H¹ top 8: {', '.join(sorted(cc.h1, key=cc.h1.get, reverse=True)[:8])}",
     ])
     progress(1.0)
@@ -331,10 +472,11 @@ def run(use_hf, dataset, split, maxrows, file, prompt,
 def ui():
     with gr.Blocks(title="NeuroSymbolic-Coho", theme=gr.themes.Soft()) as demo:
         gr.Markdown(
-            "# NeuroSymbolic-Coho v1.3\n"
-            "**Roles now have real effect** — distinct keywords, temperatures, and steer per voice.\n\n"
-            "Cochain complex **C⁰→C¹→C²→C³** · H¹ cocycle boosts · "
-            "Persistent prompt bias · Per-role logit steering · Guaranteed turn switching."
+            "# NeuroSymbolic-Coho v1.4\n"
+            "**HemiContinuity** · Roles · Persistent prompt bias · Cochain complex C⁰→C¹→C²→C³\n\n"
+            "HemiContinuity smooths probability flow between steps — tokens cannot teleport "
+            "into or out of the top-K without a penalty, enforcing coherent evolution of the "
+            "candidate distribution across the whole narrative."
         )
         with gr.Row():
             with gr.Column(scale=1):
@@ -347,7 +489,7 @@ def ui():
                 use_hf.change(lambda v:(gr.update(visible=v),gr.update(visible=not v)),
                               [use_hf],[maxrows,file])
 
-                prompt  = gr.Textbox(value="What is the meaning of life?",
+                prompt  = gr.Textbox(value="Consider the nature of persistent homology",
                                      label="Prompt",
                                      info="Content words bias every generation step.")
                 seed    = gr.Number(value=42, label="Seed")
@@ -367,6 +509,30 @@ def ui():
                     tokens_per_role = gr.Slider(20, 150, value=60, step=10,
                                                 label="Max tokens per role turn",
                                                 info="Forces a role switch after this many alpha tokens.")
+
+                with gr.Accordion("HemiContinuity", open=True):
+                    gr.Markdown(
+                        "Smooths probability flow between steps. Penalises tokens that "
+                        "suddenly enter or leave the top-K, enforcing gradual evolution "
+                        "of the candidate distribution."
+                    )
+                    hemi_enable       = gr.Checkbox(label="Enable HemiContinuity", value=True)
+                    hemi_alpha        = gr.Slider(0.0, 0.3, value=0.1, step=0.01,
+                                                  label="Smoothing α",
+                                                  info="Blend weight for previous distribution. "
+                                                       "0 = no smoothing.")
+                    hemi_top_k        = gr.Slider(10, 100, value=50, step=5,
+                                                  label="Top-K violation window",
+                                                  info="Candidates watched for sudden probability jumps.")
+                    hemi_penalty      = gr.Slider(0.0, 0.5, value=0.1, step=0.05,
+                                                  label="Violation penalty",
+                                                  info="Scale-down applied to violating tokens. "
+                                                       "0 = smooth only, no penalty.")
+                    hemi_reset_on_role = gr.Checkbox(
+                        label="Reset on role switch",
+                        value=True,
+                        info="Give each role a fresh probability context at the start of its turn.")
+
                 btn = gr.Button("Generate", variant="primary")
 
             with gr.Column(scale=2):
@@ -375,7 +541,8 @@ def ui():
 
         btn.click(run,
                   [use_hf, dataset, split, maxrows, file, prompt, seed, ntok, voices,
-                   steer, h1_str, prompt_strength, role_strength, tokens_per_role],
+                   steer, h1_str, prompt_strength, role_strength, tokens_per_role,
+                   hemi_enable, hemi_alpha, hemi_top_k, hemi_penalty, hemi_reset_on_role],
                   [out_txt, out_stat])
     return demo
 

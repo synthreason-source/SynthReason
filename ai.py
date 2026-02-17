@@ -135,7 +135,7 @@ def _detok(toks):
         if t in '.,;:!?)': out[-1]+=t if out else out.append(t)
         else: out.append(t)
     s=' '.join(out)
-    return re.sub(r'([a-z])', lambda m:m.group(1)+m.group(2).upper(), s)
+    return re.sub(r'([a-z])', lambda m:m.group(1), s)
 
 def generate(cc: CochainComplex, prompt: str, n_tokens=400, seed=42,
              n_voices=4, steer=1.2, h1_str=0.4, prompt_strength=0.6) -> str:
@@ -219,7 +219,7 @@ def ui():
                 file    = gr.File(label="Or upload .txt", file_types=[".txt",".md"], visible=False)
                 use_hf.change(lambda v:(gr.update(visible=v),gr.update(visible=not v)),
                               [use_hf],[maxrows,file])
-                prompt  = gr.Textbox(value="What is the meaning of life",
+                prompt  = gr.Textbox(value="What is the meaning of life?",
                                      label="Prompt",
                                      info="Content words exert a bias on every generation step.")
                 seed    = gr.Number(value=42, label="Seed")

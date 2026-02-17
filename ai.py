@@ -206,7 +206,7 @@ def _detok(toks: List[str]) -> str:
         else:
             out.append(t)
     s = ' '.join(out)
-    return re.sub(r'(^|[.!?] )([a-z])', lambda m: m.group(1) + m.group(2).upper(), s)
+    return re.sub(r'(^|[?] )([a-z])', lambda m: m.group(1) + m.group(2).upper(), s)
 
 
 def generate(cc: CochainComplex, prompt: str, n_tokens: int = 400, seed: int = 42,

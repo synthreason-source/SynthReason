@@ -235,7 +235,7 @@ def next_probs(state: CorpusState, w1: str, w2: str,
     pw_t = torch.tensor(pw, dtype=torch.float32)
 
     # Centroid boost (flat: strength 0.1)
-    cb = centroid_boost(w2, cands, strength=0.1)
+    cb = centroid_boost(w2, cands, strength=10.1)
     cb_t = torch.tensor(cb, dtype=torch.float32)
 
     # Token frequency boost

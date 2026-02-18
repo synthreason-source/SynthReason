@@ -399,7 +399,7 @@ def build_app():
                 use_hf = gr.Checkbox(label="Use Hugging Face Dataset", value=True)
                 hf_dataset = gr.Textbox(label="HF Dataset", value="AiresPucrs/stanford-encyclopedia-philosophy")
                 hf_split   = gr.Textbox(label="Split", value="train")
-                hf_max_rows = gr.Slider(100, 3000, value=1000, step=100, label="Max rows")
+                hf_max_rows = gr.Slider(0, 3000, value=1000, step=100, label="Max rows")
                 text_file  = gr.File(label="Upload .txt", file_types=[".txt",".md"], visible=False)
                 use_hf.change(toggle_hf, [use_hf], [hf_dataset, hf_split, hf_max_rows, text_file])
 

@@ -1,24 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-NeuroSymbolic V8.4 - Cohomology-Reduced + Calculated Word Age (AoA)
+NeuroSymbolic V8.5 - Cohomology-Reduced + Calculated Word Age (AoA)
++ Double-Entendre Dot-Product With Shift
 
-Key upgrade: Words without an AoA entry are no longer assigned a flat 10.0.
-Instead, their age-of-acquisition is *estimated* from linguistic features known
-to predict AoA in psycholinguistic research (Kuperman et al. 2012; Brysbaert &
-Biemans 2017):
+Key upgrade (this revision): replace the single hash-dot-product boost with a
+two-pass ("double entendre") dot product:
 
-  - Word length (chars)          → longer words acquired later
-  - Syllable count               → more syllables → later acquisition
-  - Morpheme complexity          → affixes push age up
-  - Phonotactic familiarity      → common bigrams → earlier acquisition
-  - Orthographic neighbourhood  → many neighbours → earlier acquisition
-  - Concreteness proxy           → imageable short words acquired earlier
-  - Log frequency proxy          → estimated from corpus counts
+  Pass 1: dot(embed(w2), embed(candidate))
+  Pass 2: dot(embed(w2) + shift(w1), embed(candidate))
 
-The estimator is a small linear model whose coefficients were hand-calibrated to
-reproduce the AoA distribution of the Kuperman norms (mean ≈ 8.5 yr, sd ≈ 2.5).
+Candidates that stay strong under BOTH frames get an agreement bonus.
 """
+
 from __future__ import annotations
 
 import re
@@ -122,8 +116,12 @@ def load_aoa_dataset(max_rows: int = 35_000) -> Dict[str, float]:
 # ────────────────────────────────────────────────────────────────────────────
 def _count_syllables(word: str) -> int:
     """Heuristic English syllable counter."""
-    w = word.lower().rstrip("e")          # silent final e
-    count = sum(1 for i, c in enumerate(w) if c in _VOWELS and (i == 0 or w[i - 1] not in _VOWELS))
+    w = word.lower().rstrip("e")  # silent final e
+    count = sum(
+        1
+        for i, c in enumerate(w)
+        if c in _VOWELS and (i == 0 or w[i - 1] not in _VOWELS)
+    )
     return max(1, count)
 
 
@@ -140,7 +138,7 @@ def _morpheme_complexity(word: str) -> float:
             break
     for s in _LATINATE_SUFFIXES:
         if w.endswith(s) and len(w) > len(s) + 2:
-            score += 0.25 * (1 + len(s) / 6)   # longer suffixes → more complex
+            score += 0.25 * (1 + len(s) / 6)  # longer suffixes → more complex
             break
     return min(1.0, score)
 
@@ -192,12 +190,12 @@ def calculate_word_age(
 
     Feature model (linear, calibrated to Kuperman distribution):
       AoA ≈ intercept
-            + β_len   * (chars - 5)           # length effect
-            + β_syl   * (syllables - 2)        # syllable effect
-            + β_morph * morpheme_complexity    # morphological complexity
-            - β_big   * bigram_familiarity     # phonotactic boost (reduces age)
-            - β_freq  * log_rel_freq           # frequency boost (reduces age)
-            - β_neigh * log(1 + neighbourhood) # neighbourhood boost
+            + β_len   * (chars - 5)
+            + β_syl   * (syllables - 2)
+            + β_morph * morpheme_complexity
+            - β_big   * bigram_familiarity
+            - β_freq  * log_rel_freq
+            - β_neigh * log(1 + neighbourhood)
     """
     w = word.lower().strip()
     if not w or not w[0].isalpha():
@@ -221,20 +219,18 @@ def calculate_word_age(
     # Corpus frequency (log relative frequency, 0 if absent)
     if corpus_freq and w in corpus_freq:
         rel_freq = corpus_freq[w] / max(corpus_total, 1)
-        log_freq = math.log(1 + rel_freq * 1_000_000)   # per-million scale
+        log_freq = math.log(1 + rel_freq * 1_000_000)  # per-million scale
     else:
         log_freq = 0.0
 
     # ── Linear model ────────────────────────────────────────────────────────
-    # Intercept calibrated so an "average" word (5 chars, 2 syl, no affixes,
-    # moderate bigrams, low freq, few neighbours) → AoA ≈ 8.5 yr
-    intercept =  8.5
-    β_len     =  0.30    # each extra char beyond 5 → +0.30 yr
-    β_syl     =  0.55    # each extra syllable beyond 2 → +0.55 yr
-    β_morph   =  2.80    # full complexity → +2.80 yr
-    β_big     =  1.60    # fully familiar bigrams → −1.60 yr
-    β_freq    =  0.18    # log-per-million frequency unit → −0.18 yr
-    β_neigh   =  0.40    # log(1 + N) neighbourhood → −0.40 yr
+    intercept = 8.5
+    β_len     = 0.30
+    β_syl     = 0.55
+    β_morph   = 2.80
+    β_big     = 1.60
+    β_freq    = 0.18
+    β_neigh   = 0.40
 
     estimated = (
         intercept
@@ -246,7 +242,6 @@ def calculate_word_age(
         - β_neigh * math.log(1 + neigh)
     )
 
-    # Clamp to realistic range [2.0, 20.0]
     return float(max(2.0, min(20.0, estimated)))
 
 
@@ -301,9 +296,18 @@ def centroid_boost(
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# HASH EMBEDDING (quotient activator)
+# DOUBLE ENTENDRE HASH EMBEDDING (two dot products + shift)
 # ────────────────────────────────────────────────────────────────────────────
-class HashEmbedder:
+class DoubleEntendreEmbedder:
+    """
+    Two-pass dot product:
+
+      pass1 = dot(embed(w2), embed(c))
+      pass2 = dot(embed(w2) + shift(w1), embed(c))
+
+    combined = 0.5*(norm01(pass1) + norm01(pass2)) + agreement_bonus*min(norm01(pass1), norm01(pass2))
+    """
+
     DIM = 4
 
     def embed(self, token: str) -> np.ndarray:
@@ -312,13 +316,43 @@ class HashEmbedder:
         s = float(vec.sum())
         return vec / (s + 1e-8)
 
-    def pairwise_weight(self, t1: str, t2_list: List[str]) -> np.ndarray:
-        v1 = self.embed(t1)
-        weights = np.array([float(np.dot(v1, self.embed(t2))) for t2 in t2_list], dtype=np.float32)
-        w_min, w_max = float(weights.min()), float(weights.max())
-        if w_max > w_min:
-            weights = (weights - w_min) / (w_max - w_min)
-        return weights
+    def shift_vector(self, token: str, magnitude: float = 0.15) -> np.ndarray:
+        h = int(hashlib.sha256(token.encode("utf-8")).hexdigest(), 16)
+        vec = np.array([(h >> (8 * i)) & 0xFF for i in range(self.DIM)], dtype=np.float32)
+        vec = vec / (np.linalg.norm(vec) + 1e-8)
+        return vec * float(magnitude)
+
+    @staticmethod
+    def _norm01(arr: np.ndarray) -> np.ndarray:
+        mn = float(arr.min())
+        mx = float(arr.max())
+        return (arr - mn) / (mx - mn + 1e-12)
+
+    def double_entendre_weights(
+        self,
+        w1: str,
+        w2: str,
+        candidates: List[str],
+        shift_mag: float = 0.15,
+        agreement_bonus: float = 0.30,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        anchor = self.embed(w2)
+        shifted_anchor = anchor + self.shift_vector(w1, magnitude=shift_mag)
+
+        # Keep the same "L1-ish" normalization style as embed()
+        shifted_anchor = shifted_anchor / (shifted_anchor.sum() + 1e-8)
+
+        cand_vecs = np.array([self.embed(c) for c in candidates], dtype=np.float32)  # (N, DIM)
+        pass1 = cand_vecs @ anchor
+        pass2 = cand_vecs @ shifted_anchor
+
+        p1 = self._norm01(pass1)
+        p2 = self._norm01(pass2)
+
+        de_score = np.minimum(p1, p2)
+        combined = 0.5 * (p1 + p2) + float(agreement_bonus) * de_score
+        combined = self._norm01(combined)
+        return p1, p2, combined
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -429,10 +463,9 @@ def detokenize(tokens: List[str]) -> str:
 @dataclass
 class CorpusState:
     lm:          NGramLM
-    embedder:    HashEmbedder
+    embedder:    DoubleEntendreEmbedder
     aoa:         Dict[str, float]
     token_boost: Dict[str, float] = field(default_factory=dict)
-    # Corpus frequency kept for calculate_word_age
     corpus_freq: Dict[str, int]   = field(default_factory=dict)
     corpus_total: int             = 1
 
@@ -441,12 +474,14 @@ def build_state(text: str, aoa: Dict[str, float]) -> CorpusState:
     tokens = tokenize(text)
     lm = NGramLM(add_k=1.5)
     lm.ingest(tokens)
-    embedder = HashEmbedder()
+    embedder = DoubleEntendreEmbedder()
+
     total = max(1, sum(lm.uni.values()))
     token_boost: Dict[str, float] = {}
     for tok, freq in lm.uni.items():
         if len(tok) > 3 and tok not in STOP_WORDS and re.match(r"^[a-z]", tok):
             token_boost[tok] = min(0.5, math.log(1 + (freq / total) * 1000.0) * 0.1)
+
     return CorpusState(
         lm=lm,
         embedder=embedder,
@@ -465,32 +500,44 @@ def next_probs(
     w1: str,
     w2: str,
     temp: float = 1.2,
-    boost_strength: float = 0.2,
+    boost_strength: float = 0.2,          # kept (but no longer used for dot prod)
+    de_strength: float = 0.18,            # strength of double-entendre similarity
+    de_shift_mag: float = 0.15,           # shift magnitude for 2nd frame
+    de_agreement_bonus: float = 0.30,     # extra reward for agreement (min)
     ema_prev: Optional[torch.Tensor] = None,
     ema_cands: Optional[List[str]] = None,
 ) -> Tuple[List[str], torch.Tensor]:
     cands, base_probs = state.lm.next_dist(w1, w2)
-    pw    = state.embedder.pairwise_weight(w2, cands)
-    pw_t  = torch.tensor(pw,   dtype=torch.float32)
-    cb    = centroid_boost(
+
+    # Double-entendre dot-product weights
+    _, _, de_combined = state.embedder.double_entendre_weights(
+        w1=w1, w2=w2, candidates=cands,
+        shift_mag=float(de_shift_mag),
+        agreement_bonus=float(de_agreement_bonus),
+    )
+    de_t = torch.tensor(de_combined, dtype=torch.float32)
+
+    cb = centroid_boost(
         state.aoa, w2, cands,
         strength=0.10,
         corpus_freq=state.corpus_freq,
         corpus_total=state.corpus_total,
     )
-    cb_t  = torch.tensor(cb,   dtype=torch.float32)
+    cb_t  = torch.tensor(cb, dtype=torch.float32)
     tb    = torch.tensor([state.token_boost.get(c, 0.0) for c in cands], dtype=torch.float32)
 
-    # AoA continuity — now using calculate_word_age for unknown words
+    # AoA continuity
     w2_age  = word_age(state.aoa, w2, state.corpus_freq, state.corpus_total)
     age_arr = np.array(
-        [age_continuity_boost(w2_age, word_age(state.aoa, c, state.corpus_freq, state.corpus_total))
-         for c in cands],
+        [age_continuity_boost(
+            w2_age,
+            word_age(state.aoa, c, state.corpus_freq, state.corpus_total),
+        ) for c in cands],
         dtype=np.float32,
     )
     age_t = torch.tensor(age_arr, dtype=torch.float32)
 
-    boosts = boost_strength * pw_t + cb_t + 0.10 * tb + 0.15 * age_t
+    boosts = float(de_strength) * de_t + cb_t + 0.10 * tb + 0.15 * age_t
     logits = torch.log(base_probs.clamp_min(1e-12)) + boosts
     logits = logits / max(float(temp), 1e-6)
     probs  = F.softmax(logits, dim=-1)
@@ -727,15 +774,16 @@ def toggle_hf(val):
 
 def build_app():
     with gr.Blocks(
-        title="NeuroSymbolic V8.4 — Calculated Word Age",
+        title="NeuroSymbolic V8.5 — Calculated Word Age + Double Entendre Dot Product",
         theme=gr.themes.Soft(),
     ) as demo:
         gr.Markdown(
-            "# NeuroSymbolic V8.4 — Cohomology-Reduced + Calculated Word Age\n"
+            "# NeuroSymbolic V8.5 — Cohomology-Reduced + Calculated Word Age\n"
             "Word age (AoA) is now **calculated** for every token, not just looked up.\n\n"
             "**Priority:** normed Kuperman 2012 → prototype list → feature-based estimator  \n"
             "**Features used:** word length, syllable count, morpheme complexity, "
-            "bigram familiarity, corpus frequency, orthographic neighbourhood size."
+            "bigram familiarity, corpus frequency, orthographic neighbourhood size.\n\n"
+            "**New:** double-entendre dot-product boost (two dot products with a shifted frame)."
         )
 
         with gr.Row():

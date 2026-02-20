@@ -572,12 +572,36 @@ def generate(
     w2 = sw[-1] if sw else "concept"
 
     voices = [
-        ("Positor",     ["what", "how", "whether", "consider"]),
-        ("Analyzer",    ["because", "therefore", "observe", "examine"]),
-        ("Synthesizer", ["thus", "between", "integrates", "suggests"]),
-        ("Reflector",   ["ultimately", "reveals", "illuminates", "perhaps"]),
-        ("Connector",   ["relates", "links", "bridges", "connects"]),
-        ("Elaborator",  ["further", "moreover", "extends", "develops"]),
+        ("Positor", [
+            "what", "how", "when", "why", "where", "whether", "imagine", "suppose", "consider", "define",
+            "state", "pose", "query", "assert", "envision", "propose", "determine", "specify", "outline", "identify",
+            "explore", "focus", "express", "declare", "suggest"
+        ]),
+        ("Analyzer", [
+            "because", "therefore", "thus", "hence", "examine", "observe", "inspect", "compare", "contrast", "deduce",
+            "infer", "evaluate", "scrutinize", "measure", "determine", "diagnose", "trace", "test", "quantify", "assess",
+            "prove", "analyze", "dissect", "uncover", "establish"
+        ]),
+        ("Synthesizer", [
+            "thus", "between", "integrates", "suggests", "combines", "merges", "connects", "unifies", "fuses", "blends",
+            "resolves", "harmonizes", "links", "joins", "bridges", "reconciles", "aligns", "connects", "coalesces", "balances",
+            "melds", "incorporates", "relates", "summarizes", "converges"
+        ]),
+        ("Reflector", [
+            "ultimately", "reveals", "illuminates", "perhaps", "maybe", "indicates", "implies", "evokes", "signifies", "suggests",
+            "contemplates", "meditates", "distills", "uncovers", "concludes", "infers", "recognizes", "appreciates", "ponders", "rethinks",
+            "interprets", "acknowledges", "realizes", "wonders", "discerns"
+        ]),
+        ("Connector", [
+            "relates", "links", "bridges", "connects", "associates", "correlates", "binds", "ties", "concatenates", "couples",
+            "unites", "joins", "interweaves", "crosses", "maps", "compares", "contextualizes", "interrelates", "interlaces", "binds",
+            "matches", "aggregates", "corresponds", "equates", "aligns"
+        ]),
+        ("Elaborator", [
+            "further", "moreover", "extends", "develops", "expands", "deepens", "broadens", "amplifies", "details", "illustrates",
+            "enhances", "supports", "enriches", "reiterates", "strengthens", "continues", "adds", "accentuates", "clarifies", "builds",
+            "reinforces", "emphasizes", "substantiates", "heightens", "extends"
+        ]),
     ][: max(1, int(num_voices))]
 
     result: List[Tuple[str, List[str]]] = []

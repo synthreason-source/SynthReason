@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-NeuroSymbolic V8.5 - Cohomology-Reduced + Calculated Word Age (AoA)
-+ Double-Entendre Dot-Product With Shift
+NeuroSymbolic V8.6 - Length-Dependent Topology Dot Products
 
-Key upgrade (this revision): replace the single hash-dot-product boost with a
-two-pass ("double entendre") dot product:
+Key upgrade (this revision): topology dot products now scale with token length.
 
-  Pass 1: dot(embed(w2), embed(candidate))
-  Pass 2: dot(embed(w2) + shift(w1), embed(candidate))
+Length-Dependent Topology:
+  - Embedding dimension DIM scales with word length (longer words → higher-dim space)
+  - topo_weight() scales with char-length, rewarding morphologically rich tokens
+  - shift_magnitude scales with length (longer words get stronger frame-shift)
+  - agreement_bonus scales with length (longer words need stronger cross-frame consensus)
+  - A length-weighted topology kernel modulates the final dot-product combination
 
-Candidates that stay strong under BOTH frames get an agreement bonus.
+This means short/simple words (cat, dog) use compact 2-4D embeddings with mild
+topology influence, while long/complex words (cohomology, reconstruction) use
+up to 12D embeddings with much stronger topological modulation.
 """
 
 from __future__ import annotations
@@ -44,18 +48,14 @@ TOPO_KEYWORDS = {
     "betti", "euler", "simplicial", "homotopy", "manifold", "morse", "sheaf"
 }
 
-# English vowels for syllable counting
 _VOWELS = set("aeiouy")
 
-# Common English phoneme bigrams (high-frequency → imply easier words)
-# Derived from Brown corpus letter-bigram frequencies
 _COMMON_BIGRAMS: set = {
     "th", "he", "in", "er", "an", "re", "on", "en", "at", "ou",
     "ed", "nd", "to", "or", "ea", "ti", "es", "st", "ar", "nt",
     "is", "al", "it", "as", "ha", "et", "se", "ng", "le", "of",
 }
 
-# Derivational affixes that mark morphologically complex (later-acquired) words
 _LATINATE_PREFIXES = {
     "pre", "post", "anti", "auto", "bio", "geo", "hyper", "hypo",
     "inter", "intra", "micro", "macro", "meta", "mono", "multi",
@@ -69,7 +69,6 @@ _LATINATE_SUFFIXES = {
     "ation", "ization", "isation",
 }
 
-# Very early-acquired core vocabulary (prototype list, mean AoA < 4 yr)
 _EARLY_WORDS: Dict[str, float] = {
     "cat": 2.5, "dog": 2.5, "mom": 2.2, "dad": 2.2, "baby": 2.8,
     "ball": 2.6, "cup": 2.7, "eye": 2.4, "ear": 2.5, "nose": 2.6,
@@ -84,7 +83,69 @@ _EARLY_WORDS: Dict[str, float] = {
 }
 
 # ────────────────────────────────────────────────────────────────────────────
-# AoA DATASET (normed + calculated fallback)
+# LENGTH-DEPENDENT TOPOLOGY PARAMETERS
+# ────────────────────────────────────────────────────────────────────────────
+
+# DIM for embedding: scales from DIM_MIN to DIM_MAX based on word length
+DIM_MIN = 2          # shortest words (len ≤ 2)
+DIM_MAX = 12         # longest words (len ≥ LENGTH_CEIL)
+LENGTH_CEIL = 14     # word length at which DIM saturates at DIM_MAX
+SHIFT_MAG_MIN = 0.05   # shift magnitude for short words
+SHIFT_MAG_MAX = 0.35   # shift magnitude for long words
+AGREEMENT_BONUS_MIN = 0.10  # agreement bonus for short words
+AGREEMENT_BONUS_MAX = 0.60  # agreement bonus for long words
+
+
+def length_alpha(word: str, ceil: int = LENGTH_CEIL) -> float:
+    """
+    Normalised length factor α ∈ [0, 1].
+    α = 0 for very short words, 1 for words at/beyond LENGTH_CEIL chars.
+    Uses a smooth sigmoid-like curve so medium-length words are partially scaled.
+    """
+    n = len(word.strip())
+    # Soft sigmoid centered at ceil/2
+    mid = ceil / 2.0
+    return float(1.0 / (1.0 + math.exp(-0.55 * (n - mid))))
+
+
+def length_dim(word: str) -> int:
+    """
+    Embedding dimension for a word, scaled by length.
+    Short words → DIM_MIN; long words → DIM_MAX.
+    Always even (for cleaner hash decomposition).
+    """
+    α = length_alpha(word)
+    raw = DIM_MIN + α * (DIM_MAX - DIM_MIN)
+    return max(DIM_MIN, int(round(raw / 2) * 2))  # round to nearest even
+
+
+def length_shift_mag(word: str) -> float:
+    """Shift magnitude scaled by word length."""
+    α = length_alpha(word)
+    return SHIFT_MAG_MIN + α * (SHIFT_MAG_MAX - SHIFT_MAG_MIN)
+
+
+def length_agreement_bonus(word: str) -> float:
+    """Agreement bonus scaled by word length."""
+    α = length_alpha(word)
+    return AGREEMENT_BONUS_MIN + α * (AGREEMENT_BONUS_MAX - AGREEMENT_BONUS_MIN)
+
+
+def length_topo_kernel(word: str) -> float:
+    """
+    A length-dependent weight for how strongly topology modulates the dot product.
+    Short words: topology has little influence.
+    Long words: topology strongly modulates the combined score.
+
+    Returns a multiplier in [0.05, 1.0].
+    """
+    α = length_alpha(word)
+    # Topology kernel: exponential ramp
+    return float(0.05 + 0.95 * (α ** 1.5))
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# AoA DATASET
 # ────────────────────────────────────────────────────────────────────────────
 AOA_DATASET_URL = (
     "https://norare.clld.org/contributions/Kuperman-2012-AoA/English-AoA-30K.csv"
@@ -94,10 +155,6 @@ AOA_COL_AOA  = "AoA"
 
 
 def load_aoa_dataset(max_rows: int = 35_000) -> Dict[str, float]:
-    """
-    Load Kuperman 2012 AoA norms from CLLD (if reachable).
-    Returns {word_lower: aoa_years}.  Falls back to {} on failure.
-    """
     try:
         df = pd.read_csv(AOA_DATASET_URL, nrows=max_rows)
         if AOA_COL_WORD not in df.columns or AOA_COL_AOA not in df.columns:
@@ -115,8 +172,7 @@ def load_aoa_dataset(max_rows: int = 35_000) -> Dict[str, float]:
 # WORD-AGE CALCULATOR
 # ────────────────────────────────────────────────────────────────────────────
 def _count_syllables(word: str) -> int:
-    """Heuristic English syllable counter."""
-    w = word.lower().rstrip("e")  # silent final e
+    w = word.lower().rstrip("e")
     count = sum(
         1
         for i, c in enumerate(w)
@@ -126,10 +182,6 @@ def _count_syllables(word: str) -> int:
 
 
 def _morpheme_complexity(word: str) -> float:
-    """
-    Returns a complexity score in [0, 1] based on recognisable derivational
-    prefixes and suffixes.  Each affix adds 0.25, capped at 1.0.
-    """
     w = word.lower()
     score = 0.0
     for p in _LATINATE_PREFIXES:
@@ -138,16 +190,12 @@ def _morpheme_complexity(word: str) -> float:
             break
     for s in _LATINATE_SUFFIXES:
         if w.endswith(s) and len(w) > len(s) + 2:
-            score += 0.25 * (1 + len(s) / 6)  # longer suffixes → more complex
+            score += 0.25 * (1 + len(s) / 6)
             break
     return min(1.0, score)
 
 
 def _bigram_familiarity(word: str) -> float:
-    """
-    Fraction of consecutive letter pairs that appear in the common-bigram set.
-    Higher → more phonotactically familiar → acquired earlier.
-    """
     w = word.lower()
     if len(w) < 2:
         return 0.5
@@ -156,11 +204,6 @@ def _bigram_familiarity(word: str) -> float:
 
 
 def _ortho_neighborhood_size(word: str, aoa_dict: Dict[str, float]) -> int:
-    """
-    Approximate orthographic neighbourhood (Coltheart's N):
-    count words in the AoA dict that differ by exactly one letter.
-    Capped at 20 for speed.
-    """
     w = word.lower()
     n = len(w)
     count = 0
@@ -180,50 +223,26 @@ def calculate_word_age(
     corpus_freq: Optional[Dict[str, int]] = None,
     corpus_total: int = 1,
 ) -> float:
-    """
-    Estimate age-of-acquisition for *word* in years.
-
-    Priority:
-      1. Normed value from Kuperman 2012 (exact match)
-      2. Prototype entry in _EARLY_WORDS
-      3. Computed estimate from linguistic features
-
-    Feature model (linear, calibrated to Kuperman distribution):
-      AoA ≈ intercept
-            + β_len   * (chars - 5)
-            + β_syl   * (syllables - 2)
-            + β_morph * morpheme_complexity
-            - β_big   * bigram_familiarity
-            - β_freq  * log_rel_freq
-            - β_neigh * log(1 + neighbourhood)
-    """
     w = word.lower().strip()
     if not w or not w[0].isalpha():
         return 10.0
-
-    # 1. Normed lookup
     if w in aoa:
         return aoa[w]
-
-    # 2. Prototype list
     if w in _EARLY_WORDS:
         return _EARLY_WORDS[w]
 
-    # ── Feature extraction ──────────────────────────────────────────────────
     n_chars   = len(w)
     n_syl     = _count_syllables(w)
     morph     = _morpheme_complexity(w)
     bigram_f  = _bigram_familiarity(w)
     neigh     = _ortho_neighborhood_size(w, aoa)
 
-    # Corpus frequency (log relative frequency, 0 if absent)
     if corpus_freq and w in corpus_freq:
         rel_freq = corpus_freq[w] / max(corpus_total, 1)
-        log_freq = math.log(1 + rel_freq * 1_000_000)  # per-million scale
+        log_freq = math.log(1 + rel_freq * 1_000_000)
     else:
         log_freq = 0.0
 
-    # ── Linear model ────────────────────────────────────────────────────────
     intercept = 8.5
     β_len     = 0.30
     β_syl     = 0.55
@@ -251,23 +270,32 @@ def word_age(
     corpus_freq: Optional[Dict[str, int]] = None,
     corpus_total: int = 1,
 ) -> float:
-    """Public accessor — uses calculate_word_age."""
     return calculate_word_age(token, aoa, corpus_freq, corpus_total)
 
 
 def age_continuity_boost(age1: float, age2: float, strength: float = 0.12) -> float:
-    """Low-differentiation: small positive bias for similar (and earlier) ages."""
     d = abs(age1 - age2)
     early = min(age1, age2, 8.0) / 8.0
     return float(strength * math.exp(-d / 3.0) * early)
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# COHOMOLOGY SCALARS
+# COHOMOLOGY SCALARS — now length-dependent
 # ────────────────────────────────────────────────────────────────────────────
 def topo_weight(token: str) -> float:
+    """
+    Topology weight, now length-dependent.
+
+    Base keyword score is amplified by the token's length-topology kernel:
+    longer tokens are more likely to carry topological meaning (e.g. "cohomology"
+    vs "co"), so we scale the raw keyword hit by length_topo_kernel().
+    """
     tl = token.lower()
-    return min(1.0, sum(0.4 for kw in TOPO_KEYWORDS if kw in tl))
+    base = min(1.0, sum(0.4 for kw in TOPO_KEYWORDS if kw in tl))
+    # Even without a keyword hit, longer words get a mild topology presence
+    length_presence = 0.05 * length_alpha(token)
+    raw = base + length_presence
+    return float(min(1.0, raw * length_topo_kernel(token)))
 
 
 def semantic_scalar(t1: str, t2: str) -> float:
@@ -296,31 +324,45 @@ def centroid_boost(
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# DOUBLE ENTENDRE HASH EMBEDDING (two dot products + shift)
+# LENGTH-DEPENDENT DOUBLE ENTENDRE EMBEDDER
 # ────────────────────────────────────────────────────────────────────────────
-class DoubleEntendreEmbedder:
+class LengthDependentEmbedder:
     """
-    Two-pass dot product:
+    Length-dependent double-entendre dot product.
 
-      pass1 = dot(embed(w2), embed(c))
-      pass2 = dot(embed(w2) + shift(w1), embed(c))
+    For each (w1, w2, candidate) triple:
+      - DIM is determined by the CANDIDATE's length (the thing being scored)
+      - shift_mag and agreement_bonus scale with the ANCHOR word (w2) length
+      - A length-topology kernel modulates the final combined score
 
-    combined = 0.5*(norm01(pass1) + norm01(pass2)) + agreement_bonus*min(norm01(pass1), norm01(pass2))
+    Two passes:
+      pass1 = dot(embed(w2, dim), embed(c, dim))
+      pass2 = dot(embed(w2, dim) + shift(w1, dim, mag), embed(c, dim))
+
+    combined = topo_kernel(c) * [0.5*(norm01(p1)+norm01(p2)) + bonus*min(p1,p2)]
+             + (1 - topo_kernel(c)) * 0.5*(norm01(p1)+norm01(p2))
+
+    This means topology modulation only kicks in for longer/more complex candidates.
     """
 
-    DIM = 4
-
-    def embed(self, token: str) -> np.ndarray:
-        h = int(hashlib.md5(token.encode("utf-8")).hexdigest(), 16)
-        vec = np.array([(h >> (8 * i)) & 0xFF for i in range(self.DIM)], dtype=np.float32)
+    def embed(self, token: str, dim: Optional[int] = None) -> np.ndarray:
+        """Hash-based embedding in `dim`-dimensional space (length-dependent if dim=None)."""
+        d = dim if dim is not None else length_dim(token)
+        # Use MD5 for the first 16 bytes, SHA256 for more if needed
+        raw_bytes = hashlib.sha256(token.encode("utf-8")).digest()  # 32 bytes
+        # Repeat to fill d bytes
+        repeated = (raw_bytes * ((d // 32) + 2))[:d]
+        vec = np.array(list(repeated), dtype=np.float32)
         s = float(vec.sum())
         return vec / (s + 1e-8)
 
-    def shift_vector(self, token: str, magnitude: float = 0.15) -> np.ndarray:
-        h = int(hashlib.sha256(token.encode("utf-8")).hexdigest(), 16)
-        vec = np.array([(h >> (8 * i)) & 0xFF for i in range(self.DIM)], dtype=np.float32)
-        vec = vec / (np.linalg.norm(vec) + 1e-8)
-        return vec * float(magnitude)
+    def shift_vector(self, token: str, dim: int, magnitude: float) -> np.ndarray:
+        """Length-aware shift: magnitude already pre-scaled by caller."""
+        raw_bytes = hashlib.md5(token.encode("utf-8")).digest()  # 16 bytes
+        repeated = (raw_bytes * ((dim // 16) + 2))[:dim]
+        vec = np.array(list(repeated), dtype=np.float32)
+        norm = np.linalg.norm(vec)
+        return (vec / (norm + 1e-8)) * magnitude
 
     @staticmethod
     def _norm01(arr: np.ndarray) -> np.ndarray:
@@ -328,39 +370,72 @@ class DoubleEntendreEmbedder:
         mx = float(arr.max())
         return (arr - mn) / (mx - mn + 1e-12)
 
-    def double_entendre_weights(
+    def length_dependent_weights(
         self,
         w1: str,
         w2: str,
         candidates: List[str],
-        shift_mag: float = 0.15,
-        agreement_bonus: float = 0.30,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        anchor = self.embed(w2)
-        shifted_anchor = anchor + self.shift_vector(w1, magnitude=shift_mag)
+        """
+        Compute length-dependent double-entendre weights for each candidate.
 
-        # Keep the same "L1-ish" normalization style as embed()
-        shifted_anchor = shifted_anchor / (shifted_anchor.sum() + 1e-8)
+        Returns (pass1_norm, pass2_norm, combined) all in [0,1].
+        """
+        N = len(candidates)
+        pass1_raw = np.zeros(N, dtype=np.float32)
+        pass2_raw = np.zeros(N, dtype=np.float32)
+        topo_kernels = np.zeros(N, dtype=np.float32)
 
-        cand_vecs = np.array([self.embed(c) for c in candidates], dtype=np.float32)  # (N, DIM)
-        pass1 = cand_vecs @ anchor
-        pass2 = cand_vecs @ shifted_anchor
+        # Anchor parameters depend on w2's length
+        anchor_shift_mag  = length_shift_mag(w2)
+        anchor_agree_bonus = length_agreement_bonus(w2)
 
-        p1 = self._norm01(pass1)
-        p2 = self._norm01(pass2)
+        for i, c in enumerate(candidates):
+            # Each candidate uses its own length-dependent DIM
+            dim = length_dim(c)
+
+            # Embed w2 and candidate in the candidate's dimensional space
+            e_w2 = self.embed(w2, dim=dim)
+            e_c  = self.embed(c,  dim=dim)
+
+            # Shift uses w1 in the same dim
+            shift = self.shift_vector(w1, dim=dim, magnitude=anchor_shift_mag)
+            e_w2_shifted = e_w2 + shift
+            norm_s = float(e_w2_shifted.sum())
+            e_w2_shifted = e_w2_shifted / (abs(norm_s) + 1e-8)
+
+            pass1_raw[i] = float(np.dot(e_w2, e_c))
+            pass2_raw[i] = float(np.dot(e_w2_shifted, e_c))
+            topo_kernels[i] = length_topo_kernel(c)
+
+        p1 = self._norm01(pass1_raw)
+        p2 = self._norm01(pass2_raw)
 
         de_score = np.minimum(p1, p2)
-        combined = 0.5 * (p1 + p2) + float(agreement_bonus) * de_score
+
+        # Base combination (same for all candidates)
+        base_combined = 0.5 * (p1 + p2)
+
+        # Agreement bonus scales with w2 length (anchor-level parameter)
+        agreement_part = float(anchor_agree_bonus) * de_score
+
+        # Topology kernel gates how much the agreement bonus applies
+        # Short candidates: topology kernel ≈ 0 → agreement bonus suppressed
+        # Long candidates: topology kernel ≈ 1 → full agreement bonus
+        combined = base_combined + topo_kernels * agreement_part
         combined = self._norm01(combined)
+
         return p1, p2, combined
+
+
+# Keep the old name as an alias for backwards compatibility
+DoubleEntendreEmbedder = LengthDependentEmbedder
 
 
 # ────────────────────────────────────────────────────────────────────────────
 # LANGUAGE MODEL
 # ────────────────────────────────────────────────────────────────────────────
 class NGramLM:
-    """Trigram LM with high add_k for flat (low-differentiation) distributions."""
-
     def __init__(self, add_k: float = 1.5):
         self.add_k  = float(add_k)
         self.uni:   Dict[str, int]                    = {}
@@ -463,7 +538,7 @@ def detokenize(tokens: List[str]) -> str:
 @dataclass
 class CorpusState:
     lm:          NGramLM
-    embedder:    DoubleEntendreEmbedder
+    embedder:    LengthDependentEmbedder
     aoa:         Dict[str, float]
     token_boost: Dict[str, float] = field(default_factory=dict)
     corpus_freq: Dict[str, int]   = field(default_factory=dict)
@@ -474,7 +549,7 @@ def build_state(text: str, aoa: Dict[str, float]) -> CorpusState:
     tokens = tokenize(text)
     lm = NGramLM(add_k=1.5)
     lm.ingest(tokens)
-    embedder = DoubleEntendreEmbedder()
+    embedder = LengthDependentEmbedder()
 
     total = max(1, sum(lm.uni.values()))
     token_boost: Dict[str, float] = {}
@@ -500,20 +575,15 @@ def next_probs(
     w1: str,
     w2: str,
     temp: float = 1.2,
-    boost_strength: float = 0.2,          # kept (but no longer used for dot prod)
-    de_strength: float = 0.18,            # strength of double-entendre similarity
-    de_shift_mag: float = 0.15,           # shift magnitude for 2nd frame
-    de_agreement_bonus: float = 0.30,     # extra reward for agreement (min)
+    de_strength: float = 0.18,
     ema_prev: Optional[torch.Tensor] = None,
     ema_cands: Optional[List[str]] = None,
 ) -> Tuple[List[str], torch.Tensor]:
     cands, base_probs = state.lm.next_dist(w1, w2)
 
-    # Double-entendre dot-product weights
-    _, _, de_combined = state.embedder.double_entendre_weights(
+    # Length-dependent double-entendre dot-product weights
+    _, _, de_combined = state.embedder.length_dependent_weights(
         w1=w1, w2=w2, candidates=cands,
-        shift_mag=float(de_shift_mag),
-        agreement_bonus=float(de_agreement_bonus),
     )
     de_t = torch.tensor(de_combined, dtype=torch.float32)
 
@@ -526,7 +596,6 @@ def next_probs(
     cb_t  = torch.tensor(cb, dtype=torch.float32)
     tb    = torch.tensor([state.token_boost.get(c, 0.0) for c in cands], dtype=torch.float32)
 
-    # AoA continuity
     w2_age  = word_age(state.aoa, w2, state.corpus_freq, state.corpus_total)
     age_arr = np.array(
         [age_continuity_boost(
@@ -537,12 +606,17 @@ def next_probs(
     )
     age_t = torch.tensor(age_arr, dtype=torch.float32)
 
-    boosts = float(de_strength) * de_t + cb_t + 0.10 * tb + 0.15 * age_t
+    # Length-dependent topology also modulates the centroid boost
+    topo_kernels = torch.tensor(
+        [length_topo_kernel(c) for c in cands], dtype=torch.float32
+    )
+    topo_cb = cb_t * (0.5 + 0.5 * topo_kernels)  # short words: 0.5x; long: 1x boost
+
+    boosts = float(de_strength) * de_t + topo_cb + 0.10 * tb + 0.15 * age_t
     logits = torch.log(base_probs.clamp_min(1e-12)) + boosts
     logits = logits / max(float(temp), 1e-6)
     probs  = F.softmax(logits, dim=-1)
 
-    # EMA smoothing
     if ema_prev is not None and ema_cands is not None:
         prev_idx = {w: i for i, w in enumerate(ema_cands)}
         aligned  = torch.zeros_like(probs)
@@ -572,37 +646,37 @@ def generate(
     w2 = sw[-1] if sw else "concept"
 
     voices = [
-        ("Positor", [
-            "what", "how", "when", "why", "where", "whether", "imagine", "suppose", "consider", "define",
-            "state", "pose", "query", "assert", "envision", "propose", "determine", "specify", "outline", "identify",
-            "explore", "focus", "express", "declare", "suggest"
-        ]),
-        ("Analyzer", [
-            "because", "therefore", "thus", "hence", "examine", "observe", "inspect", "compare", "contrast", "deduce",
-            "infer", "evaluate", "scrutinize", "measure", "determine", "diagnose", "trace", "test", "quantify", "assess",
-            "prove", "analyze", "dissect", "uncover", "establish"
-        ]),
-        ("Synthesizer", [
-            "thus", "between", "integrates", "suggests", "combines", "merges", "connects", "unifies", "fuses", "blends",
-            "resolves", "harmonizes", "links", "joins", "bridges", "reconciles", "aligns", "connects", "coalesces", "balances",
-            "melds", "incorporates", "relates", "summarizes", "converges"
-        ]),
-        ("Reflector", [
-            "ultimately", "reveals", "illuminates", "perhaps", "maybe", "indicates", "implies", "evokes", "signifies", "suggests",
-            "contemplates", "meditates", "distills", "uncovers", "concludes", "infers", "recognizes", "appreciates", "ponders", "rethinks",
-            "interprets", "acknowledges", "realizes", "wonders", "discerns"
-        ]),
-        ("Connector", [
-            "relates", "links", "bridges", "connects", "associates", "correlates", "binds", "ties", "concatenates", "couples",
-            "unites", "joins", "interweaves", "crosses", "maps", "compares", "contextualizes", "interrelates", "interlaces", "binds",
-            "matches", "aggregates", "corresponds", "equates", "aligns"
-        ]),
-        ("Elaborator", [
-            "further", "moreover", "extends", "develops", "expands", "deepens", "broadens", "amplifies", "details", "illustrates",
-            "enhances", "supports", "enriches", "reiterates", "strengthens", "continues", "adds", "accentuates", "clarifies", "builds",
-            "reinforces", "emphasizes", "substantiates", "heightens", "extends"
-        ]),
-    ][: max(1, int(num_voices))]
+    ("Positor", [
+        "what", "how", "when", "why", "where", "whether", "imagine", "suppose", "consider", "define",
+        "state", "pose", "query", "assert", "envision", "propose", "determine", "specify", "outline", "identify",
+        "explore", "focus", "express", "declare", "suggest"
+    ]),
+    ("Analyzer", [
+        "because", "therefore", "thus", "hence", "examine", "observe", "inspect", "compare", "contrast", "deduce",
+        "infer", "evaluate", "scrutinize", "measure", "determine", "diagnose", "trace", "test", "quantify", "assess",
+        "prove", "analyze", "dissect", "uncover", "establish"
+    ]),
+    ("Synthesizer", [
+        "thus", "between", "integrates", "suggests", "combines", "merges", "connects", "unifies", "fuses", "blends",
+        "resolves", "harmonizes", "links", "joins", "bridges", "reconciles", "aligns", "connects", "coalesces", "balances",
+        "melds", "incorporates", "relates", "summarizes", "converges"
+    ]),
+    ("Reflector", [
+        "ultimately", "reveals", "illuminates", "perhaps", "maybe", "indicates", "implies", "evokes", "signifies", "suggests",
+        "contemplates", "meditates", "distills", "uncovers", "concludes", "infers", "recognizes", "appreciates", "ponders", "rethinks",
+        "interprets", "acknowledges", "realizes", "wonders", "discerns"
+    ]),
+    ("Connector", [
+        "relates", "links", "bridges", "connects", "associates", "correlates", "binds", "ties", "concatenates", "couples",
+        "unites", "joins", "interweaves", "crosses", "maps", "compares", "contextualizes", "interrelates", "interlaces", "binds",
+        "matches", "aggregates", "corresponds", "equates", "aligns"
+    ]),
+    ("Elaborator", [
+        "further", "moreover", "extends", "develops", "expands", "deepens", "broadens", "amplifies", "details", "illustrates",
+        "enhances", "supports", "enriches", "reiterates", "strengthens", "continues", "adds", "accentuates", "clarifies", "builds",
+        "reinforces", "emphasizes", "substantiates", "heightens", "extends"
+    ]),
+][: max(1, int(num_voices))]
 
     result: List[Tuple[str, List[str]]] = []
     current_voice = 0
@@ -687,16 +761,12 @@ def load_corpus(
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# AGE ANALYSIS HELPER (for stats panel)
+# AGE + LENGTH ANALYSIS HELPER
 # ────────────────────────────────────────────────────────────────────────────
-def age_analysis(
+def age_and_length_analysis(
     state: CorpusState,
     top_n: int = 10,
 ) -> str:
-    """
-    Produce a brief report on word-age distribution in the corpus vocabulary.
-    Shows which words are youngest/oldest by calculated AoA.
-    """
     alpha_vocab = [t for t in state.lm.vocab if t.isalpha() and t not in STOP_WORDS]
     if not alpha_vocab:
         return "No alpha vocabulary found."
@@ -706,7 +776,6 @@ def age_analysis(
         for t in alpha_vocab
     }
     sorted_ages = sorted(ages.items(), key=lambda x: x[1])
-
     youngest = sorted_ages[:top_n]
     oldest   = sorted_ages[-top_n:][::-1]
 
@@ -716,6 +785,27 @@ def age_analysis(
     sd_age   = math.sqrt(
         sum((v - mean_age) ** 2 for v in ages.values()) / max(1, len(ages))
     )
+
+    # Length-dependent topology analysis
+    topo_by_len: Dict[int, List[Tuple[str, float]]] = {}
+    for t in alpha_vocab:
+        d   = length_dim(t)
+        tw  = topo_weight(t)
+        α   = length_alpha(t)
+        kern = length_topo_kernel(t)
+        if d not in topo_by_len:
+            topo_by_len[d] = []
+        topo_by_len[d].append((t, tw * kern))
+
+    dim_summary_lines = []
+    for d in sorted(topo_by_len.keys()):
+        entries = topo_by_len[d]
+        avg_tw  = sum(v for _, v in entries) / max(1, len(entries))
+        top_ex  = sorted(entries, key=lambda x: -x[1])[:3]
+        ex_str  = ", ".join(f"{w}({v:.2f})" for w, v in top_ex)
+        dim_summary_lines.append(
+            f"  DIM={d:2d} | {len(entries):4d} words | mean topo×kernel={avg_tw:.3f} | top: {ex_str}"
+        )
 
     lines = [
         f"Alpha vocab: {len(alpha_vocab)} words",
@@ -728,7 +818,14 @@ def age_analysis(
         "",
         f"Oldest {top_n} (latest acquired):",
         "  " + ", ".join(f"{w}({a:.1f})" for w, a in oldest),
-    ]
+        "",
+        "── Length-Dependent Topology Dot-Product Summary ──",
+        f"  DIM range: {DIM_MIN}–{DIM_MAX}  |  length ceil: {LENGTH_CEIL}",
+        f"  shift_mag range: {SHIFT_MAG_MIN:.2f}–{SHIFT_MAG_MAX:.2f}",
+        f"  agreement_bonus range: {AGREEMENT_BONUS_MIN:.2f}–{AGREEMENT_BONUS_MAX:.2f}",
+        "",
+    ] + dim_summary_lines
+
     return "\n".join(lines)
 
 
@@ -737,7 +834,7 @@ def age_analysis(
 # ────────────────────────────────────────────────────────────────────────────
 def run_session(
     use_hf, hf_dataset, hf_split, hf_max_rows,
-    text_file, prompt, seed, max_tokens, num_voices, temp,
+    text_file, prompt, seed, max_tokens, num_voices, temp, tokens_per_turn,
     progress=gr.Progress(),
 ):
     try:
@@ -750,8 +847,8 @@ def run_session(
         progress(0.40, desc="Building language model…")
         state = build_state(text, aoa)
 
-        progress(0.60, desc="Analysing word ages…")
-        age_stats = age_analysis(state)
+        progress(0.60, desc="Analysing word ages + length topology…")
+        age_stats = age_and_length_analysis(state)
 
         progress(0.70, desc="Generating narrative…")
         out_md = generate(
@@ -760,23 +857,34 @@ def run_session(
             seed=int(seed),
             num_voices=int(num_voices),
             temp=float(temp),
+            tokens_per_turn=int(tokens_per_turn),
         )
 
         vocab_size  = len(state.lm.vocab)
-        topo_hits   = [t for t in state.lm.vocab if topo_weight(t) > 0]
+        topo_hits   = [t for t in state.lm.vocab if topo_weight(t) > 0.05]
         normed      = sum(1 for t in state.lm.vocab if t.isalpha() and t in aoa)
         alpha_total = sum(1 for t in state.lm.vocab if t.isalpha())
+
+        # Sample length-dim distribution
+        alpha_vocab = [t for t in state.lm.vocab if t.isalpha()]
+        dim_counts: Dict[int, int] = {}
+        for t in alpha_vocab:
+            d = length_dim(t)
+            dim_counts[d] = dim_counts.get(d, 0) + 1
+        dim_dist = "  " + "  ".join(f"DIM{d}:{n}" for d, n in sorted(dim_counts.items()))
 
         stats = "\n".join([
             f"Vocab size: {vocab_size}",
             f"AoA normed (Kuperman exact):    {normed}/{alpha_total}",
             f"AoA calculated (feature model): {alpha_total - normed}/{alpha_total}",
-            f"Topo tokens: {len(topo_hits)} ({', '.join(topo_hits[:8])})",
-            f"Temperature: {float(temp):.2f}",
-            f"add_k: {state.lm.add_k:.2f}",
+            f"Topo tokens (length-weighted):  {len(topo_hits)}",
+            f"Temperature: {float(temp):.2f}  |  add_k: {state.lm.add_k:.2f}",
             f"Generated tokens: {int(max_tokens)}",
             "",
-            "── Word-Age Distribution ──",
+            "── Length→DIM distribution ──",
+            dim_dist,
+            "",
+            "── Word-Age + Length-Topology Analysis ──",
             age_stats,
         ])
         return out_md, stats
@@ -798,16 +906,21 @@ def toggle_hf(val):
 
 def build_app():
     with gr.Blocks(
-        title="NeuroSymbolic V8.5 — Calculated Word Age + Double Entendre Dot Product",
+        title="NeuroSymbolic V8.6 — Length-Dependent Topology Dot Products",
         theme=gr.themes.Soft(),
     ) as demo:
         gr.Markdown(
-            "# NeuroSymbolic V8.5 — Cohomology-Reduced + Calculated Word Age\n"
-            "Word age (AoA) is now **calculated** for every token, not just looked up.\n\n"
-            "**Priority:** normed Kuperman 2012 → prototype list → feature-based estimator  \n"
-            "**Features used:** word length, syllable count, morpheme complexity, "
-            "bigram familiarity, corpus frequency, orthographic neighbourhood size.\n\n"
-            "**New:** double-entendre dot-product boost (two dot products with a shifted frame)."
+            "# NeuroSymbolic V8.6 — Length-Dependent Topology Dot Products\n"
+            "The topology dot-product now **scales with word/token length**.\n\n"
+            "| Parameter | Short words | Long words |\n"
+            "|-----------|------------|------------|\n"
+            "| Embedding DIM | 2–4 | 8–12 |\n"
+            "| Shift magnitude | 0.05 | 0.35 |\n"
+            "| Agreement bonus | 0.10 | 0.60 |\n"
+            "| Topo kernel gate | ~0.05 | ~1.0 |\n\n"
+            "**Effect:** Short words (cat, big) have compact, lightly modulated dot products. "
+            "Long words (cohomology, reconstruction) use high-dimensional embeddings with strong "
+            "topological agreement gating and large frame-shift vectors."
         )
 
         with gr.Row():
@@ -823,6 +936,7 @@ def build_app():
                 max_tokens  = gr.Slider(100, 800, value=300, step=50, label="Max Tokens")
                 num_voices  = gr.Slider(2, 6,    value=3,   step=1,  label="Narrative Voices")
                 temp        = gr.Slider(0.8, 2.5, value=1.4, step=0.1, label="Temperature")
+                tokens_per_turn = gr.Slider(20, 200, value=170, step=10, label="Tokens per Role")
 
             with gr.Column(scale=2):
                 prompt = gr.Textbox(
@@ -833,22 +947,23 @@ def build_app():
                 btn = gr.Button("Generate", variant="primary", size="lg")
                 gr.Markdown("## Generated Narrative (roles)")
                 output_md    = gr.Markdown(value="")
-                output_stats = gr.Textbox(label="Stats + Word-Age Analysis", lines=20)
+                output_stats = gr.Textbox(label="Stats + Length-Topology Analysis", lines=25)
 
         btn.click(
             run_session,
             inputs=[use_hf, hf_dataset, hf_split, hf_max_rows,
-                    text_file, prompt, seed, max_tokens, num_voices, temp],
+                    text_file, prompt, seed, max_tokens, num_voices, temp, tokens_per_turn],
             outputs=[output_md, output_stats],
         )
 
         gr.Markdown(
-            "### Notes\n"
-            "- If the Kuperman CSV is unreachable, the model falls back to the "
-            "feature-based estimator for *all* tokens (no flat 10.0).\n"
-            "- Install: `pip install gradio datasets torch pandas numpy`\n"
-            "- The word-age estimator is calibrated to the Kuperman distribution "
-            "(mean ≈ 8.5 yr, SD ≈ 2.5 yr)."
+            "### Design Notes\n"
+            "- `length_alpha(word)` → smooth sigmoid in [0,1] centered at half of `LENGTH_CEIL`\n"
+            "- `length_dim(word)` → embedding dimension 2–12 (always even, rounded)\n"
+            "- `length_topo_kernel(word)` → gates agreement bonus: short=0.05, long≈1.0\n"
+            "- `topo_weight(word)` → keyword hit × length_topo_kernel (length-amplified)\n"
+            "- `centroid_boost` modulated by topo_kernel: short words get 0.5× boost\n"
+            "- Install: `pip install gradio datasets torch pandas numpy`"
         )
     return demo
 

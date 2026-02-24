@@ -916,8 +916,9 @@ def load_corpus(
 # ──────────────────────────────────────────────────────────────────────────
 
 def run_session(
-    use_hf, hf_dataset, hf_split, hf_max_rows, text_file, prompt, seed,
-    tokens_per_sentence, temp, progress=gr.Progress(),
+    use_hf, hf_dataset, hf_split, hf_max_rows, text_file, prompt,
+    seed, num_sentences, tokens_per_sentence, temp,  # 10 inputs total
+    progress=gr.Progress(),
 ):
     try:
         progress(0.05, desc="Loading AoA dataset (Kuperman 2012)…")
@@ -930,7 +931,7 @@ def run_session(
         progress(0.30, desc="Building language model and form plan…")
         state = build_state(text, aoa, prompt=str(prompt))
         
-        progress(0.50, desc="Generating 100 sentences (one form per sentence)…")
+        progress(0.50, desc="Generating sentences (one form per sentence)…")
         sentences = generate_100_sentences(
             state, str(prompt), seed=int(seed),
             tokens_per_sentence=int(tokens_per_sentence),
@@ -961,13 +962,7 @@ def build_app():
         theme=gr.themes.Soft(),
     ) as demo:
         gr.Markdown(
-            "# NeuroSymbolic V8.6+ — N Sentences, One Form Per Sentence\\n\\n"
-            "**Architecture:**\\n"
-            "1. Extract words from your prompt (first sentence)\\n"
-            "2. Create N unique syntactic forms, cycling through extracted words\\n"
-            "3. Generate N sentences, each featuring exactly one form\\n"
-            "4. Track each form's activation and influence across sentences\\n\\n"
-            "**New:** Adjustable number of sentences (1-500)"
+            "# NeuroSymbolic V8.6+ — N Sentences"
         )
         
         with gr.Row():

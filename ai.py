@@ -985,7 +985,7 @@ def build_app():
                     1, 500, value=100, step=10, 
                     label="Number of Sentences"
                 )
-                tokens_per_sentence = gr.Slider(8, 80, value=15, step=2, 
+                tokens_per_sentence = gr.Slider(8, 180, value=15, step=2, 
                                                label="Tokens per Sentence")
                 temp = gr.Slider(0.8, 2.5, value=1.2, step=0.1, label="Temperature")
             
@@ -1025,3 +1025,4 @@ def build_app():
 if __name__ == "__main__":
     app = build_app()
     app.queue().launch(share=False)
+

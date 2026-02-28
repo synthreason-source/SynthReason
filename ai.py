@@ -1371,7 +1371,7 @@ def build_app():
                     1, 500, value=100, step=10, label="Number of Sentences"
                 )
                 tokens_per_sentence = gr.Slider(
-                    8, 180, value=92, step=2, label="Tokens per Sentence"
+                    8, 1800, value=92, step=2, label="Tokens per Sentence"
                 )
                 temp = gr.Slider(0.8, 2.5, value=1.7, step=0.1, label="Temperature")
 

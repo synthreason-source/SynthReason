@@ -1345,10 +1345,10 @@ def build_app():
     for 100 form generation.
     """
     with gr.Blocks(
-        title="NeuroSymbolic V8.6+ — 100 Sentences, One Form Each",
+        title="NeuroSymbolic V8.6+",
         theme=gr.themes.Soft(),
     ) as demo:
-        gr.Markdown("# NeuroSymbolic V8.6+ — 100 Sentences, One Form Per Sentence")
+        gr.Markdown("# NeuroSymbolic V8.6+")
 
         with gr.Row():
             with gr.Column(scale=1):
@@ -1400,7 +1400,7 @@ def build_app():
 
         gr.Markdown(
             "### Key Features\n"
-            "- **100 Sentences, One Form Each:** Ensures full syntactic coverage\n"
+            "- **N Sentences, One Form Each:** Ensures full syntactic coverage\n"
             "- **Form Count:** Exactly 100 forms, one per sentence\n"
             "- **Form Boost:** Semantic similarity to form's word (25% weight)\n"
             "- **Activation Tracking:** Cumulative value + influence map\n"

@@ -205,6 +205,10 @@ class SyntacticForm:
         self.spreading_context: List[str] = []
         self.value_accumulated: float = 0.0
 
+        # Syntactic grouping variance: carried forward from previous sentence
+        # via dot-addition (next_form.grouping_variance += current_variance)
+        self.grouping_variance: float = 0.0
+
     def __repr__(self) -> str:
         """String representation for debugging."""
         return f"{self.word}[{self.form_name}@sent{self.sentence_index}]"
@@ -242,6 +246,23 @@ class SyntacticForm:
         the cumulative influence of the form across all sentences and spreading contexts.
         """
         return self.total_activation + self.value_accumulated
+
+    def compute_grouping_variance(self) -> float:
+        """
+        REASONING (Syntactic Grouping Variance):
+        Variance across per-sentence activation strengths measures how
+        consistently or variably a form dominates its assigned contexts.
+        High variance = the form is strong in some sentences and absent in
+        others; low variance = steady activation. This scalar is propagated
+        via dot-addition (next_form.grouping_variance += current_variance)
+        to the immediately following sentence's form, creating a momentum
+        signal that biases next-word selection toward the same word cluster.
+        """
+        vals = list(self.activation_per_sentence.values())
+        if len(vals) < 2:
+            return 0.0
+        arr = np.array(vals, dtype=np.float32)
+        return float(np.var(arr))
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -1139,6 +1160,13 @@ def next_probs(
 
     topo_cb = cb_t * (0.5 + 0.5 * topo_kernels)
 
+    # Syntactic grouping variance boost (dot-added from previous sentence)
+    variance_boost = torch.zeros_like(de_t)
+    if current_form and current_form.grouping_variance > 0.0:
+        variance_scale = min(0.15, current_form.grouping_variance)
+        for idx, c in enumerate(cands):
+            variance_boost[idx] = variance_scale * semantic_similarity(current_form.word, c)
+
     # Combine all boosts
     boosts = (
         float(de_strength) * de_t
@@ -1146,6 +1174,7 @@ def next_probs(
         + 0.10 * tb
         + 0.15 * age_t
         + form_boost
+        + variance_boost
     )
 
     logits = torch.log(base_probs.clamp_min(1e-12)) + boosts
@@ -1231,6 +1260,12 @@ def generate_100_sentences(
                 form_activation=1.0,
                 influenced_words=list(influenced_words),
             )
+
+            # Syntactic grouping variance — dot-addition to next sentence
+            if sent_idx < 99:
+                next_form = state.sentence_form_plan.form_by_sentence.get(sent_idx + 1)
+                if next_form:
+                    next_form.grouping_variance += form.compute_grouping_variance()
 
     return "\n".join(result_sentences)
 

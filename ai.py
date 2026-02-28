@@ -205,10 +205,6 @@ class SyntacticForm:
         self.spreading_context: List[str] = []
         self.value_accumulated: float = 0.0
 
-        # Syntactic grouping variance: carried forward from previous sentence
-        # via dot-addition (next_form.grouping_variance += current_variance)
-        self.grouping_variance: float = 0.0
-
     def __repr__(self) -> str:
         """String representation for debugging."""
         return f"{self.word}[{self.form_name}@sent{self.sentence_index}]"
@@ -246,23 +242,6 @@ class SyntacticForm:
         the cumulative influence of the form across all sentences and spreading contexts.
         """
         return self.total_activation + self.value_accumulated
-
-    def compute_grouping_variance(self) -> float:
-        """
-        REASONING (Syntactic Grouping Variance):
-        Variance across per-sentence activation strengths measures how
-        consistently or variably a form dominates its assigned contexts.
-        High variance = the form is strong in some sentences and absent in
-        others; low variance = steady activation. This scalar is propagated
-        via dot-addition (next_form.grouping_variance += current_variance)
-        to the immediately following sentence's form, creating a momentum
-        signal that biases next-word selection toward the same word cluster.
-        """
-        vals = list(self.activation_per_sentence.values())
-        if len(vals) < 2:
-            return 0.0
-        arr = np.array(vals, dtype=np.float32)
-        return float(np.var(arr))
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -1160,13 +1139,6 @@ def next_probs(
 
     topo_cb = cb_t * (0.5 + 0.5 * topo_kernels)
 
-    # Syntactic grouping variance boost (dot-added from previous sentence)
-    variance_boost = torch.zeros_like(de_t)
-    if current_form and current_form.grouping_variance > 0.0:
-        variance_scale = min(0.15, current_form.grouping_variance)
-        for idx, c in enumerate(cands):
-            variance_boost[idx] = variance_scale * semantic_similarity(current_form.word, c)
-
     # Combine all boosts
     boosts = (
         float(de_strength) * de_t
@@ -1174,7 +1146,6 @@ def next_probs(
         + 0.10 * tb
         + 0.15 * age_t
         + form_boost
-        + variance_boost
     )
 
     logits = torch.log(base_probs.clamp_min(1e-12)) + boosts
@@ -1261,12 +1232,6 @@ def generate_100_sentences(
                 influenced_words=list(influenced_words),
             )
 
-            # Syntactic grouping variance — dot-addition to next sentence
-            if sent_idx < 99:
-                next_form = state.sentence_form_plan.form_by_sentence.get(sent_idx + 1)
-                if next_form:
-                    next_form.grouping_variance += form.compute_grouping_variance()
-
     return "\n".join(result_sentences)
 
 
@@ -1280,6 +1245,9 @@ def load_corpus(
     hf_split: str,
     hf_max_rows: int,
     text_file,
+    hf_config: str = "",
+    hf_col: str = "",
+    hf_token: str = "",
 ) -> str:
     """
     REASONING (Sentences 56-59):
@@ -1291,9 +1259,17 @@ def load_corpus(
     characters gracefully.
     """
     if use_hf:
-        ds = load_dataset(hf_dataset, split=hf_split)
+        load_kwargs = {"split": hf_split}
+        if hf_config and hf_config.strip():
+            load_kwargs["name"] = hf_config.strip()
+        if hf_token and hf_token.strip():
+            load_kwargs["token"] = hf_token.strip()
+        ds = load_dataset(hf_dataset, **load_kwargs)
         rows = min(int(hf_max_rows) if int(hf_max_rows) > 0 else len(ds), len(ds))
-        col = "text" if "text" in ds.column_names else ds.column_names[0]
+        if hf_col and hf_col.strip() and hf_col.strip() in ds.column_names:
+            col = hf_col.strip()
+        else:
+            col = "text" if "text" in ds.column_names else ds.column_names[0]
         return "\n".join(str(x) for x in ds.select(range(rows))[col])
 
     if text_file is None:
@@ -1315,6 +1291,9 @@ def run_session(
     hf_dataset,
     hf_split,
     hf_max_rows,
+    hf_config,
+    hf_col,
+    hf_token,
     text_file,
     prompt,
     seed,
@@ -1334,7 +1313,13 @@ def run_session(
         aoa = load_aoa_dataset()
 
         progress(0.15, desc="Loading corpus…")
-        text = load_corpus(bool(use_hf), str(hf_dataset), str(hf_split), int(hf_max_rows), text_file)
+        text = load_corpus(
+            bool(use_hf), str(hf_dataset), str(hf_split), int(hf_max_rows),
+            text_file,
+            hf_config=str(hf_config),
+            hf_col=str(hf_col),
+            hf_token=str(hf_token),
+        )
 
         progress(0.30, desc="Building language model and form plan…")
         state = build_state(text, aoa, prompt=str(prompt))
@@ -1362,10 +1347,13 @@ def run_session(
 def toggle_hf(val):
     """Toggle between HuggingFace dataset and local file modes."""
     return (
-        gr.update(visible=val),
-        gr.update(visible=val),
-        gr.update(visible=val),
-        gr.update(visible=not val),
+        gr.update(visible=val),   # hf_dataset
+        gr.update(visible=val),   # hf_split
+        gr.update(visible=val),   # hf_max_rows
+        gr.update(visible=val),   # hf_config
+        gr.update(visible=val),   # hf_col
+        gr.update(visible=val),   # hf_token
+        gr.update(visible=not val),  # text_file
     )
 
 
@@ -1393,13 +1381,32 @@ def build_app():
                     value="AiresPucrs/stanford-encyclopedia-philosophy"
                 )
                 hf_split = gr.Textbox(label="Split", value="train")
-                hf_max_rows = gr.Slider(0, 2000, value=300, step=100, label="Max rows")
+                hf_max_rows = gr.Slider(0, 2000, value=300, step=100, label="Max rows (0 = all)")
+                hf_config = gr.Textbox(
+                    label="Dataset Config / Subset",
+                    placeholder="e.g. wikitext-2-raw-v1  (leave blank if not needed)",
+                    value="",
+                )
+                hf_col = gr.Textbox(
+                    label="Text Column Override",
+                    placeholder="e.g. sentence  (leave blank to auto-detect 'text')",
+                    value="",
+                )
+                hf_token = gr.Textbox(
+                    label="HF Token (private datasets)",
+                    placeholder="hf_…  (leave blank for public datasets)",
+                    value="",
+                    type="password",
+                )
                 text_file = gr.File(
                     label="Upload .txt/.md",
                     file_types=[".txt", ".md"],
                     visible=False
                 )
-                use_hf.change(toggle_hf, [use_hf], [hf_dataset, hf_split, hf_max_rows, text_file])
+                use_hf.change(
+                    toggle_hf, [use_hf],
+                    [hf_dataset, hf_split, hf_max_rows, hf_config, hf_col, hf_token, text_file]
+                )
 
                 seed = gr.Number(value=42, label="Seed")
                 num_sentences = gr.Slider(
@@ -1427,7 +1434,8 @@ def build_app():
         btn.click(
             run_session,
             inputs=[
-                use_hf, hf_dataset, hf_split, hf_max_rows, text_file,
+                use_hf, hf_dataset, hf_split, hf_max_rows,
+                hf_config, hf_col, hf_token, text_file,
                 prompt, seed, num_sentences, tokens_per_sentence, temp
             ],
             outputs=[output_sentences, output_report],

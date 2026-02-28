@@ -991,9 +991,8 @@ def detokenize(tokens: List[str]) -> str:
                 out.append(t)
 
     s = " ".join(out)
-    s = re.sub(r"\(\s+", "(", s)
-    s = re.sub(r"\s+\)", ")", s)
-    s = re.sub(r"(^|[.!?]\s+)([a-z])", lambda m: m.group(1) + m.group(2).upper(), s)
+
+    s = re.sub(r"([a-z])", lambda m: m.group(1), s)
 
     return s
 
@@ -1372,9 +1371,9 @@ def build_app():
                     1, 500, value=100, step=10, label="Number of Sentences"
                 )
                 tokens_per_sentence = gr.Slider(
-                    8, 180, value=15, step=2, label="Tokens per Sentence"
+                    8, 180, value=92, step=2, label="Tokens per Sentence"
                 )
-                temp = gr.Slider(0.8, 2.5, value=1.2, step=0.1, label="Temperature")
+                temp = gr.Slider(0.8, 2.5, value=1.7, step=0.1, label="Temperature")
 
             with gr.Column(scale=2):
                 prompt = gr.Textbox(

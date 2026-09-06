@@ -1,9 +1,38 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+NGram Engine + Image-Modulated Generation
+===============================================================================
+This replaces the previous "V18-RP-ANISO-RIPPLE-SPAGHETTI-CARDAN" engine
+(hyperbolic Bolyai/Thebault token geometry + Cardan Grille Isomorphism vocab
+partitions + Mirrored Instruction Distribution + the 23-strand "spaghetti"
+router) with a much simpler, transparent core: an n-gram backoff language
+model (`NGramModel`) plus a TF-IDF/SVD corpus-evidence layer (`CorpusSearch`).
+
+Everything under SECTION 1-3 is the n-gram core (previously a separate
+script); it is now the main generation engine end to end.
+
+The one piece of the old engine that is preserved is the *image recognition
+/ image-modulated generation* feature: a picture can be uploaded in the
+Gradio UI, optionally scaled by a live Arduino sensor reading, and it biases
+which tokens get chosen during generation. In the old script this lived in
+`NanowireCanvas` / `NanowireStream` and operated on torch tensors of
+(rho, theta, sigma) token coordinates. Since the n-gram model has no such
+geometry, it's re-implemented here as `ImagePixelModulator`: each candidate
+token is deterministically mapped to a column of the image, and that
+column's average color feeds three lightweight "brush" trends (contrast,
+chromatic phase, glow) that combine into a per-token bias, exactly mirroring
+the spirit (and the three-brush structure) of the original.
+"""
+
 from __future__ import annotations
 
 import json
 import math
+import os
 import random
 import re
+import threading
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
@@ -11,27 +40,86 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
+import gradio as gr
+
+try:
+    import serial
+except Exception:  # pyserial may not be installed / no Arduino attached
+    serial = None
+
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import TruncatedSVD
 from sklearn.preprocessing import normalize
 
-# ============================================================
-# Small n-gram language model + corpus similarity search.
+
+# ════════════════════════════════════════════════════════════════════════════
+# SECTION 0 — AUTONOMIC ARDUINO CARRIER  (preserved from the old GUI)
+# ════════════════════════════════════════════════════════════════════════════
+# Same role as before: an optional live sensor value (0..1) that scales how
+# strongly the uploaded image modulates generation. Defaults to 1.0 so
+# everything works fine with no Arduino attached.
+
+LATEST_AUTONOMIC_VAL = 1.0
+AUTONOMIC_SAVE_FILE = "autonomic_state.json"
+
+
+def autonomic_serial_worker(port: str = "COM4", baud: int = 9600) -> None:
+    global LATEST_AUTONOMIC_VAL
+    if serial is None:
+        return
+    try:
+        ser = serial.Serial(port, baud)
+        print(f"Listening to Arduino on {port}...")
+        while True:
+            try:
+                line = ser.readline().decode("utf-8", errors="ignore").strip()
+                if line.isdigit():
+                    LATEST_AUTONOMIC_VAL = int(line) / 1023.0
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"Serial stream error: {e}")
+
+
+threading.Thread(target=autonomic_serial_worker, daemon=True).start()
+
+
+def save_autonomic_ui() -> str:
+    global LATEST_AUTONOMIC_VAL
+    try:
+        with open(AUTONOMIC_SAVE_FILE, "w") as f:
+            json.dump({"autonomic_value": LATEST_AUTONOMIC_VAL}, f, indent=4)
+        return f"Saved value: {LATEST_AUTONOMIC_VAL:.4f}"
+    except Exception as e:
+        return f"Error saving: {e}"
+
+
+def load_autonomic_ui() -> Tuple[str, float]:
+    global LATEST_AUTONOMIC_VAL
+    if os.path.exists(AUTONOMIC_SAVE_FILE):
+        try:
+            with open(AUTONOMIC_SAVE_FILE, "r") as f:
+                data = json.load(f)
+            val = float(data.get("autonomic_value", 1.0))
+            LATEST_AUTONOMIC_VAL = val
+            return f"Loaded value: {val:.4f}", val
+        except Exception as e:
+            return f"Error loading: {e}", float(LATEST_AUTONOMIC_VAL)
+    return "No saved state found.", float(LATEST_AUTONOMIC_VAL)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# SECTION 1 — N-GRAM CORE  (this is now "the main AI")
+# ════════════════════════════════════════════════════════════════════════════
 #
 # Pipeline per user turn:
-#   1. tokenize prompt, find closest corpus sentences (display only)
+#   1. tokenize prompt, find closest corpus sentences (evidence display)
 #   2. run several independent "scratch" generations from the model
-#   3. combine those runs into a single candidate modifier: tokens
-#      that show up consistently across runs reinforce each other,
-#      tokens that only appear in a minority of runs cancel out
-#   4. sample the final continuation, using that modifier (blended
-#      50/50 with the raw baseline token probability) to bias the
-#      per-token scores
-#
-# (The original script also computed a "post-generation rebinding"
-#  pass and a "second generation" pass, but neither was ever
-#  displayed or used — removed as dead code.)
-# ============================================================
+#   3. combine those runs into a single candidate modifier: tokens that
+#      show up consistently across runs reinforce each other, tokens that
+#      only appear in a minority of runs cancel out
+#   4. sample the final continuation, biased by that consensus modifier,
+#      the corpus evidence modifier, AND (new) the image modulator below.
 
 MODEL_PATH = "model.json"
 
@@ -49,15 +137,14 @@ CANDIDATE_LIMIT = 15
 LEXICAL_WEIGHT = 0.45
 VECTOR_WEIGHT = 0.55
 
-# how hard the corpus evidence modifier (SUPPORTED/REFUTED sentences)
-# pushes the final generation's per-token scores
 EVIDENCE_WEIGHT = 0.4
 
-# --- consensus / "cancel out" ensemble settings ---
-NUM_GENERATIONS = 5        # how many scratch runs to generate per turn
-CANCEL_STRENGTH = 1.0      # how hard disagreement between runs is penalized
-MODIFIER_WEIGHT = 0.6      # how much the consensus modifier biases the final generation
-CONSENSUS_BASELINE_SPLIT = 0.5  # 0.0 = pure baseline prob, 1.0 = pure consensus modifier
+NUM_GENERATIONS = 5
+CANCEL_STRENGTH = 1.0
+MODIFIER_WEIGHT = 0.6
+CONSENSUS_BASELINE_SPLIT = 0.5
+
+IMAGE_WEIGHT = 0.5  # default strength of the preserved image modulation
 
 RANDOM_SEED = 2026
 random.seed(RANDOM_SEED)
@@ -65,10 +152,6 @@ random.seed(RANDOM_SEED)
 TOKEN_RE = re.compile(r"[A-Za-z0-9_']+|[.,!?;:()\[\]{}\-]")
 IGNORED_TOKENS = {"<bos>", "<eos>", "<unk>"}
 
-
-# ============================================================
-# Text utilities
-# ============================================================
 
 def tokenize(text: str) -> List[str]:
     return TOKEN_RE.findall(text.lower())
@@ -108,16 +191,7 @@ def lexical_overlap(a: Iterable[str], b: Iterable[str]) -> float:
     return len(sa & sb) / union if union else 0.0
 
 
-# ============================================================
-# Evidence
-#
-# Each corpus sentence is treated as a standing hypothesis about
-# the world. Every user prompt is an observation that either
-# supports it, contradicts it, or says nothing about it. Evidence
-# accumulates across turns instead of being recomputed from
-# scratch each time, so a sentence's status can evolve (or become
-# CONFLICTED) as the conversation goes on.
-# ============================================================
+# ---------------- Evidence ----------------
 
 class Evidence(Enum):
     TRUE = "⊤"
@@ -171,17 +245,7 @@ class EvidenceRecord:
         }[self.state]
 
 
-# ============================================================
-# Geometric text space (TF-IDF -> SVD -> normalized vectors)
-#
-# Replaces the old raw bag-of-words cosine similarity. Sparse
-# term-count cosine tends to reward any shared word equally; TF-IDF
-# downweights corpus-wide filler and SVD lets sentences that share
-# no exact words still land close together if they share context.
-# The similarity SCALE this pipeline produces is much smaller than
-# a hand-picked constant like 0.35 would assume, so thresholds are
-# calibrated per turn from what's actually achievable (see analyze).
-# ============================================================
+# ---------------- Geometric text space (TF-IDF -> SVD) ----------------
 
 class GeometricDataset:
     def __init__(self, texts: List[str], dimensions: int = 16) -> None:
@@ -210,10 +274,6 @@ class GeometricDataset:
         return self.transform([text])[0]
 
 
-# ============================================================
-# Corpus similarity search (used for the "candidates" display)
-# ============================================================
-
 @dataclass
 class CorpusReference:
     sentence: str
@@ -241,16 +301,12 @@ class Candidate:
 
 class CorpusSearch:
     """
-    Finds corpus sentences closest to a prompt, and classifies each
-    one as supported, refuted, unresolved, or conflicted evidence
-    given everything said so far this session.
+    Finds corpus sentences closest to a prompt, and classifies each one as
+    supported, refuted, unresolved, or conflicted evidence given everything
+    said so far this session.
     """
 
-    def __init__(
-        self,
-        lexical_weight: float = LEXICAL_WEIGHT,
-        vector_weight: float = VECTOR_WEIGHT,
-    ) -> None:
+    def __init__(self, lexical_weight: float = LEXICAL_WEIGHT, vector_weight: float = VECTOR_WEIGHT) -> None:
         self.lexical_weight = lexical_weight
         self.vector_weight = vector_weight
         self.references: List[CorpusReference] = []
@@ -288,12 +344,6 @@ class CorpusSearch:
 
         similarities = [float(np.dot(prompt_vector, ref.vector)) for ref in self.references]
 
-        # Calibrate this turn's support/contradiction bar against what
-        # this prompt actually achieved, instead of a fixed constant
-        # tuned for a different similarity scale (dense embeddings).
-        # contradiction_threshold is kept <= support_threshold so a
-        # negated-but-on-topic prompt is caught as a contradiction
-        # before it can be mistaken for support.
         ceiling = max(similarities) if similarities else 0.0
         support_threshold = 0.55 * ceiling
         contradiction_threshold = 0.45 * ceiling
@@ -335,17 +385,6 @@ class CorpusSearch:
                 )
             )
 
-            # --- compartmental evidence modifier ---
-            # Each reference is its own compartment: its (sim, symbolic)
-            # -> score is computed independently, then spread onto only
-            # that reference's own tokens, signed by its evidence state.
-            # SUPPORTED sentences push their tokens up, REFUTED sentences
-            # push theirs down, CONFLICTED sentences push proportionally
-            # to which side currently outweighs the other, and UNRESOLVED
-            # sentences contribute nothing. Compartments are then summed
-            # additively per token, so a token repeated across several
-            # supported sentences accumulates more bias than one that
-            # only shows up once.
             state = ref.evidence.state
             if state is Evidence.TRUE:
                 sign = 1.0
@@ -354,7 +393,7 @@ class CorpusSearch:
             elif state is Evidence.CONFLICT:
                 total = ref.evidence.total
                 sign = (ref.evidence.true_count - ref.evidence.false_count) / total if total else 0.0
-            else:  # UNKNOWN
+            else:
                 sign = 0.0
 
             if sign != 0.0:
@@ -376,9 +415,71 @@ class CorpusSearch:
         return candidates, evidence_modifier
 
 
-# ============================================================
-# N-gram language model
-# ============================================================
+# ════════════════════════════════════════════════════════════════════════════
+# SECTION 2 — IMAGE MODULATION  (preserved "image recognition" feature)
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Old version: NanowireCanvas/NanowireStream operated on torch tensors of
+# per-token (rho, theta, sigma) hyperbolic coordinates and looked up image
+# columns by normalizing those coordinates into pixel positions, then ran
+# three "brush" trends (contrast-sharpen, chromatic-phase, bloom-glow) over
+# the resulting intensities.
+#
+# The n-gram model has no such geometry, so each token is instead mapped to
+# a stable pseudo-random column position via a hash of the token string
+# itself. Everything else — the three-brush structure, and scaling by the
+# live Arduino "autonomic" value — is preserved.
+
+class ImagePixelModulator:
+    """Biases token selection using an uploaded image, optionally scaled by
+    a live sensor reading. This is the preserved image-modulation feature."""
+
+    def __init__(self) -> None:
+        self.image: Optional[np.ndarray] = None  # (H, W, 3) float32 in [0, 1]
+
+    def update_image(self, numpy_img, autonomic_value: float = 1.0) -> None:
+        if numpy_img is None:
+            self.image = None
+            return
+        if isinstance(numpy_img, dict):
+            for key in ("composite", "image", "background"):
+                if numpy_img.get(key) is not None:
+                    numpy_img = numpy_img[key]
+                    break
+            else:
+                self.image = None
+                return
+        if not isinstance(numpy_img, np.ndarray) or numpy_img.ndim != 3 or numpy_img.shape[2] < 3:
+            self.image = None
+            return
+        img = numpy_img[:, :, :3].astype(np.float32) / 255.0
+        img = np.clip(img * max(0.0, float(autonomic_value)), 0.0, 1.0)
+        self.image = img
+
+    @staticmethod
+    def _token_position(token: str) -> float:
+        h = 0
+        for ch in token:
+            h = (h * 131 + ord(ch)) & 0xFFFFFFFF
+        return (h % 10007) / 10007.0
+
+    def token_bias(self, token: str) -> float:
+        """Returns a bias in roughly [-0.5, 0.5], 0.0 if no image is set."""
+        if self.image is None:
+            return 0.0
+        H, W, _ = self.image.shape
+        x = int(self._token_position(token) * (W - 1))
+        column = self.image[:, x, :]
+        r_mean, g_mean, b_mean = (float(v) for v in column.mean(axis=0))
+        contrast = 1.0 / (1.0 + math.exp(-8.0 * (r_mean - 0.5)))   # "ContrastSharpen" brush
+        phase = 1.0 + 0.5 * math.sin(g_mean * 3.0 * math.pi)        # "ChromaticPhase" brush
+        glow = math.tanh(3.0 * b_mean)                               # "BloomGlow" brush
+        return (contrast * phase * glow) - 0.5
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# SECTION 3 — N-GRAM LANGUAGE MODEL  (extended with an image_modulator hook)
+# ════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class NGramModel:
@@ -489,6 +590,8 @@ class NGramModel:
         modifier_weight: float = 0.0,
         evidence_modifier: Optional[Dict[str, float]] = None,
         evidence_weight: float = 0.0,
+        image_modulator: Optional[ImagePixelModulator] = None,
+        image_weight: float = 0.0,
     ) -> Dict[str, float]:
         if not self.finalized:
             self.finalize()
@@ -513,9 +616,6 @@ class NGramModel:
                 + curve * 0.65 * influence
             )
             if candidate_modifier and modifier_weight:
-                # Split the difference between the ensemble consensus
-                # ("census") weight and the raw baseline probability for
-                # this token, instead of using the consensus weight alone.
                 consensus_weight = candidate_modifier.get(token, 0.0)
                 baseline_prob = base.get(token, 0.0)
                 blended_bias = (
@@ -524,13 +624,9 @@ class NGramModel:
                 )
                 score += modifier_weight * blended_bias
             if evidence_modifier and evidence_weight:
-                # Signed compartmental bias from CorpusSearch: positive
-                # for tokens belonging to SUPPORTED corpus sentences,
-                # negative for REFUTED ones, applied directly (unlike
-                # the consensus modifier this one is meaningfully
-                # negative, so it isn't blended toward a nonnegative
-                # baseline probability).
                 score += evidence_weight * evidence_modifier.get(token, 0.0)
+            if image_modulator is not None and image_weight:
+                score += image_weight * image_modulator.token_bias(token)
             scores[token] = score
         return scores
 
@@ -543,10 +639,12 @@ class NGramModel:
         modifier_weight: float = 0.0,
         evidence_modifier: Optional[Dict[str, float]] = None,
         evidence_weight: float = 0.0,
+        image_modulator: Optional[ImagePixelModulator] = None,
+        image_weight: float = 0.0,
     ) -> Dict[str, float]:
         scores = self._score_next_token(
             prompt, candidate_limit, candidate_modifier, modifier_weight,
-            evidence_modifier, evidence_weight,
+            evidence_modifier, evidence_weight, image_modulator, image_weight,
         )
         if not scores:
             return {}
@@ -566,10 +664,12 @@ class NGramModel:
         modifier_weight: float = 0.0,
         evidence_modifier: Optional[Dict[str, float]] = None,
         evidence_weight: float = 0.0,
+        image_modulator: Optional[ImagePixelModulator] = None,
+        image_weight: float = 0.0,
     ) -> str:
         probs = self._probabilities(
             prompt, temperature, max(top_k, 1), candidate_modifier, modifier_weight,
-            evidence_modifier, evidence_weight,
+            evidence_modifier, evidence_weight, image_modulator, image_weight,
         )
         if not probs:
             return self.eos_token
@@ -587,28 +687,25 @@ class NGramModel:
         modifier_weight: float = 0.0,
         evidence_modifier: Optional[Dict[str, float]] = None,
         evidence_weight: float = 0.0,
+        image_modulator: Optional[ImagePixelModulator] = None,
+        image_weight: float = 0.0,
     ) -> str:
         generated = tokenize(prompt)
         for _ in range(max_new_tokens):
             token = self.sample_next(
                 " ".join(generated), temperature, top_k, candidate_modifier, modifier_weight,
-                evidence_modifier, evidence_weight,
+                evidence_modifier, evidence_weight, image_modulator, image_weight,
             )
-            #if token == self.eos_token:
-                #break
             generated.append(token)
         return self.detokenize(generated)
 
     def generate_with_trace(
         self, prompt: str, max_new_tokens: int, temperature: float, top_k: int
     ) -> Tuple[str, List[str]]:
-        """Generate once and also return just the newly generated tokens."""
         generated = tokenize(prompt)
         start = len(generated)
         for _ in range(max_new_tokens):
             token = self.sample_next(" ".join(generated), temperature, top_k)
-            #if token == self.eos_token:
-                #break
             generated.append(token)
         return self.detokenize(generated), generated[start:]
 
@@ -620,7 +717,8 @@ class NGramModel:
         temperature: float = 0.8,
         top_k: int = 20,
     ) -> List[List[str]]:
-        """Run several independent scratch generations from the same prompt."""
+        """Run several independent scratch generations from the same prompt.
+        Left unbiased by consensus/evidence/image so the runs stay independent."""
         runs: List[List[str]] = []
         for _ in range(num_generations):
             _, new_tokens = self.generate_with_trace(prompt, max_new_tokens, temperature, top_k)
@@ -632,20 +730,11 @@ class NGramModel:
         runs: List[List[str]], cancel_strength: float = CANCEL_STRENGTH
     ) -> Dict[str, float]:
         """
-        Combine multiple generation runs ("arrays") into one candidate modifier.
+        modifier[token] = mean_count(token) - cancel_strength * std(token)
 
-        Each run is turned into a token-count vector. The vectors are
-        combined by taking their mean and then subtracting the
-        disagreement between them (population std-dev), scaled by
-        cancel_strength:
-
-            modifier[token] = mean_count(token) - cancel_strength * std(token)
-
-        Tokens that appear consistently across runs (low variance) survive
-        and reinforce each other. Tokens that only show up in a minority of
-        runs (high variance relative to their mean) get cancelled out to
-        zero or below and are dropped. The surviving values are normalized
-        to 0..1 so they can be blended into the scoring function.
+        Tokens that appear consistently across runs (low variance) survive;
+        tokens that only show up in a minority of runs cancel out to <= 0
+        and are dropped. Survivors are normalized to 0..1.
         """
         if not runs:
             return {}
@@ -682,20 +771,14 @@ class NGramModel:
         modifier_weight: float = MODIFIER_WEIGHT,
         evidence_modifier: Optional[Dict[str, float]] = None,
         evidence_weight: float = 0.0,
+        image_modulator: Optional[ImagePixelModulator] = None,
+        image_weight: float = 0.0,
     ) -> Tuple[str, List[List[str]], Dict[str, float]]:
         """
-        Full pipeline: run several scratch generations, cancel them out
-        against each other into a candidate modifier, then do one more
-        final generation. The final generation's per-token bias splits
-        the difference between that consensus modifier and each token's
-        raw baseline probability (see CONSENSUS_BASELINE_SPLIT), and is
-        additionally pushed by the corpus evidence_modifier (from
-        CorpusSearch.analyze) toward tokens belonging to currently
-        SUPPORTED sentences and away from REFUTED ones. Scratch runs are
-        left unbiased so they stay independent of each other.
-
-        Returns (final_text, scratch_runs, modifier) so callers can inspect
-        what survived the cancel-out pass.
+        Full pipeline: run several scratch generations, cancel them out into
+        a consensus modifier, then do one more final generation biased by
+        that consensus modifier, the corpus evidence_modifier, and (new)
+        the image_modulator.
         """
         runs = self.multi_generate(prompt, num_generations, max_new_tokens, temperature, top_k)
         modifier = self.build_candidate_modifier(runs, cancel_strength)
@@ -708,6 +791,8 @@ class NGramModel:
             modifier_weight=modifier_weight,
             evidence_modifier=evidence_modifier,
             evidence_weight=evidence_weight,
+            image_modulator=image_modulator,
+            image_weight=image_weight,
         )
         return final_text, runs, modifier
 
@@ -764,107 +849,212 @@ class NGramModel:
         return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
 
 
-# ============================================================
-# Display
-# ============================================================
+# ════════════════════════════════════════════════════════════════════════════
+# SECTION 4 — ENGINE WRAPPER  (plays the role the old V18RPEngine played)
+# ════════════════════════════════════════════════════════════════════════════
 
-def display_candidates(candidates: List[Candidate]) -> None:
-    print()
-    print("=" * 70)
-    print("REASONING")
-    print("=" * 70)
+class NGramEngine:
+    def __init__(self) -> None:
+        self.model: Optional[NGramModel] = None
+        self.search: Optional[CorpusSearch] = None
+        self.modulator = ImagePixelModulator()
+        self._initialised = False
+
+    def train(self, corpus_text: str, min_count: int = MIN_COUNT, influence_tau: float = INFLUENCE_TAU) -> None:
+        self.model = NGramModel(min_count=min_count, influence_tau=influence_tau)
+        self.model.ingest_text(corpus_text)
+        self.model.finalize()
+        self.search = CorpusSearch(LEXICAL_WEIGHT, VECTOR_WEIGHT)
+        self.search.build_index(corpus_text)
+        self._initialised = True
+
+    def generate(
+        self,
+        prompt: str,
+        num_generations: int,
+        max_new_tokens: int,
+        temperature: float,
+        top_k: int,
+        cancel_strength: float,
+        modifier_weight: float,
+        evidence_weight: float,
+        image_weight: float,
+        autonomic_value: float,
+        art_image,
+    ) -> Tuple[str, List[Candidate], List[List[str]], Dict[str, float]]:
+        assert self._initialised and self.model is not None and self.search is not None
+        self.modulator.update_image(art_image, autonomic_value)
+        candidates, evidence_modifier = self.search.analyze(prompt, limit=CANDIDATE_LIMIT)
+        final_text, runs, modifier = self.model.generate_consensus(
+            prompt,
+            num_generations=num_generations,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            cancel_strength=cancel_strength,
+            modifier_weight=modifier_weight,
+            evidence_modifier=evidence_modifier,
+            evidence_weight=evidence_weight,
+            image_modulator=self.modulator,
+            image_weight=image_weight,
+        )
+        return final_text, candidates, runs, modifier
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# SECTION 5 — DISPLAY HELPERS
+# ════════════════════════════════════════════════════════════════════════════
+
+def _format_candidates(candidates: List[Candidate]) -> str:
     if not candidates:
-        print("No candidates found.")
-        return
+        return "No candidates found."
+    lines = []
     for c in candidates:
-        print(f"\n[{c.rank}] score={c.score:.3f}  state={c.state.value} ({c.verdict})  {c.sentence}")
-        print(
+        lines.append(f"[{c.rank}] score={c.score:.3f}  state={c.state.value} ({c.verdict})  {c.sentence}")
+        lines.append(
             f"      sim={c.vector_similarity:.3f}  symbolic={c.symbolic_overlap:.3f}  "
             f"true={c.true_count}  false={c.false_count}  "
             f"consistency={c.consistency:.2f}  samples={c.samples}"
         )
+    return "\n".join(lines)
 
 
-def display_ensemble(runs: List[List[str]], modifier: Dict[str, float]) -> None:
-    print()
-    print("=" * 70)
-    print(f"ENSEMBLE ({len(runs)} scratch generations, cancelled against each other)")
-    print("=" * 70)
+def _format_ensemble(runs: List[List[str]], modifier: Dict[str, float]) -> str:
+    lines = [f"{len(runs)} scratch generations (cancelled against each other):"]
     for i, run in enumerate(runs, start=1):
         preview = NGramModel.detokenize(run[:20])
-        print(f"\n[run {i}] {preview}{' ...' if len(run) > 20 else ''}")
+        lines.append(f"[run {i}] {preview}{' ...' if len(run) > 20 else ''}")
     top_survivors = sorted(modifier.items(), key=lambda kv: kv[1], reverse=True)[:15]
-    print("\nSurviving tokens after cancel-out (top 15):")
+    lines.append("")
+    lines.append("Surviving tokens after cancel-out (top 15):")
     if not top_survivors:
-        print("  (none survived — runs disagreed on everything)")
+        lines.append("  (none survived — runs disagreed on everything)")
     for token, weight in top_survivors:
-        print(f"  {token!r:<15} weight={weight:.3f}")
+        lines.append(f"  {token!r:<15} weight={weight:.3f}")
+    return "\n".join(lines)
 
 
-def display_generation(generated: str) -> None:
-    print()
-    print("=" * 70)
-    print("GENERATED")
-    print("=" * 70)
-    print()
-    print(generated)
+# ════════════════════════════════════════════════════════════════════════════
+# SECTION 6 — GRADIO GUI
+# ════════════════════════════════════════════════════════════════════════════
+
+_engine: Optional[NGramEngine] = None
 
 
-# ============================================================
-# Main
-# ============================================================
+def _gui_init(file_in, min_count, influence_tau):
+    global _engine
+    try:
+        if file_in is None:
+            return "❌ No file uploaded."
+        text = Path(file_in.name).read_text(encoding="utf-8", errors="replace")
+        _engine = NGramEngine()
+        _engine.train(text, min_count=int(min_count), influence_tau=float(influence_tau))
+        return (
+            "✅ N-gram engine trained.\n"
+            f"Vocabulary: {len(_engine.model.vocabulary):,}\n"
+            f"Unigrams: {len(_engine.model.unigram):,}\n"
+            f"Bigram contexts: {len(_engine.model.bigram):,}\n"
+            f"Trigram contexts: {len(_engine.model.trigram):,}\n"
+            f"Corpus sentences indexed: {len(_engine.search.references):,}"
+        )
+    except Exception:
+        import traceback
+        return f"❌ Error:\n{traceback.format_exc()}"
 
-def main() -> None:
-    corpus_path = Path(input("Filename: "))
-    if not corpus_path.exists():
-        print(f"\nERROR: {corpus_path} does not exist.")
-        return
 
-    corpus_text = corpus_path.read_text(encoding="utf-8")
-
-    if Path(MODEL_PATH).exists():
-        print("\nLoading existing model...")
-        model = NGramModel.load_json(MODEL_PATH)
-    else:
-        print("\nTraining n-gram model...")
-        model = NGramModel(min_count=MIN_COUNT, influence_tau=INFLUENCE_TAU)
-        model.ingest_text(corpus_text)
-        model.finalize()
-        model.save_json(MODEL_PATH)
-
-    print(f"\nVocabulary: {len(model.vocabulary)}")
-    print(f"Unigrams: {len(model.unigram)}")
-    print(f"Bigram contexts: {len(model.bigram)}")
-    print(f"Trigram contexts: {len(model.trigram)}")
-
-    search = CorpusSearch(lexical_weight=LEXICAL_WEIGHT, vector_weight=VECTOR_WEIGHT)
-    search.build_index(corpus_text)  # built once, not on every turn
-
-    while True:
-        prompt = input("\nUSER: ").strip()
-        if not prompt:
-            print("Empty prompt.")
-            continue
-
-        candidates, evidence_modifier = search.analyze(prompt, limit=CANDIDATE_LIMIT)
-        display_candidates(candidates)
-
-        print(f"\nRunning {NUM_GENERATIONS} scratch generations to build a consensus modifier...")
-        final_text, runs, modifier = model.generate_consensus(
+def _gui_generate(prompt, n_gens, max_tokens, temp, top_k, cancel_strength,
+                   mod_weight, evid_weight, img_weight, art_image):
+    global _engine, LATEST_AUTONOMIC_VAL
+    if _engine is None or not _engine._initialised:
+        return "❌ Initialise engine first.", "", ""
+    try:
+        final_text, candidates, runs, modifier = _engine.generate(
             prompt,
-            num_generations=NUM_GENERATIONS,
-            max_new_tokens=MAX_NEW_TOKENS,
-            temperature=TEMPERATURE,
-            top_k=TOP_K,
-            cancel_strength=CANCEL_STRENGTH,
-            modifier_weight=MODIFIER_WEIGHT,
-            evidence_modifier=evidence_modifier,
-            evidence_weight=EVIDENCE_WEIGHT,
+            int(n_gens), int(max_tokens), float(temp), int(top_k),
+            float(cancel_strength), float(mod_weight), float(evid_weight), float(img_weight),
+            LATEST_AUTONOMIC_VAL, art_image,
+        )
+        return final_text, _format_candidates(candidates), _format_ensemble(runs, modifier)
+    except Exception:
+        import traceback
+        return f"❌ Error:\n{traceback.format_exc()}", "", ""
+
+
+def build_gradio_app() -> gr.Blocks:
+    with gr.Blocks(title="NGram Engine + Image-Modulated Generation") as demo:
+        gr.Markdown("# NGram Engine")
+        gr.Markdown(
+            "Core generation now runs on a trigram/bigram backoff model "
+            "(`NGramModel`) plus a TF-IDF/SVD corpus-evidence layer "
+            "(`CorpusSearch`), instead of the previous hyperbolic-geometry / "
+            "Cardan-grille / spaghetti-router engine.\n\n"
+            "**Image modulation is preserved**: an uploaded picture — "
+            "optionally scaled by a live Arduino sensor reading — still "
+            "biases which tokens get chosen during generation, via "
+            "`ImagePixelModulator`."
         )
 
-        print("\nGenerating final (modifier- and evidence-biased)...")
-        display_generation(final_text)
+        with gr.Tab("Init / Train"):
+            file_in = gr.File(label="Upload corpus .txt")
+            with gr.Row():
+                min_count = gr.Slider(1, 10, value=MIN_COUNT, step=1, label="Min token count")
+                influence_tau = gr.Slider(0.0, 1.0, value=INFLUENCE_TAU, step=0.05,
+                                           label="Influence similarity threshold")
+            init_btn = gr.Button("Train Engine")
+            init_out = gr.Textbox(lines=10, label="Init output")
+            init_btn.click(_gui_init, inputs=[file_in, min_count, influence_tau], outputs=init_out)
 
+        with gr.Tab("Generate"):
+            prompt_txt = gr.Textbox(label="Prompt", lines=2)
+            with gr.Row():
+                n_gens = gr.Slider(1, 12, value=NUM_GENERATIONS, step=1, label="Scratch generations")
+                max_tokens = gr.Slider(10, 500, value=MAX_NEW_TOKENS, step=10, label="Max new tokens")
+                temp = gr.Slider(0.1, 2.0, value=TEMPERATURE, step=0.05, label="Temperature")
+                top_k = gr.Slider(1, 100, value=TOP_K, step=1, label="Top-k")
+            with gr.Row():
+                cancel_strength = gr.Slider(0.0, 3.0, value=CANCEL_STRENGTH, step=0.1, label="Cancel strength")
+                mod_weight = gr.Slider(0.0, 2.0, value=MODIFIER_WEIGHT, step=0.05, label="Consensus modifier weight")
+                evid_weight = gr.Slider(0.0, 2.0, value=EVIDENCE_WEIGHT, step=0.05, label="Evidence weight")
+                img_weight = gr.Slider(0.0, 2.0, value=IMAGE_WEIGHT, step=0.05, label="Image modulation weight")
+           
+            gr.Markdown("### Upload Image (modulates generation; scaled by the Arduino carrier below)")
+            with gr.Row():
+                try:
+                    art_img = gr.ImageEditor(type="numpy", label="Modulation image", image_mode="RGB")
+                except AttributeError:
+                    art_img = gr.Image(tool="color-sketch", type="numpy", label="Modulation image")
+                """
+                with gr.Column():
+                    gr.Markdown("**Live Arduino Stream (A0)**")
+                    live_arduino_ui = gr.Slider(0.0, 1.0, value=1.0, interactive=False,
+                                                 label="Current autonomic carrier intensity")
+                    refresh_arduino_btn = gr.Button("Refresh Sensor Value")
+                    with gr.Row():
+                        save_arduino_btn = gr.Button("Save Autonomic State")
+                        load_arduino_btn = gr.Button("Load Autonomic State")
+                    autonomic_status_out = gr.Textbox(label="Save/Load Status", interactive=False, lines=1)
+                    """
+            gen_btn = gr.Button("Generate")
+            gen_out = gr.Textbox(lines=10, label="Generated text")
+            cand_out = gr.Textbox(lines=14, label="Corpus evidence / candidates")
+            ens_out = gr.Textbox(lines=14, label="Ensemble (scratch runs + surviving tokens)")
+
+            #refresh_arduino_btn.click(fn=lambda: LATEST_AUTONOMIC_VAL, inputs=[], outputs=[live_arduino_ui])
+            #save_arduino_btn.click(fn=save_autonomic_ui, inputs=[], outputs=[autonomic_status_out])
+            #load_arduino_btn.click(fn=load_autonomic_ui, inputs=[], outputs=[autonomic_status_out, live_arduino_ui])
+
+            gen_btn.click(
+                _gui_generate,
+                inputs=[prompt_txt, n_gens, max_tokens, temp, top_k, cancel_strength,
+                        mod_weight, evid_weight, img_weight, art_img],
+                outputs=[gen_out, cand_out, ens_out],
+            )
+    return demo
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# SECTION 7 — ENTRY POINT
+# ════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    main()
+    build_gradio_app().launch(share=False)

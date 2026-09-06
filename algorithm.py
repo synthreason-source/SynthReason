@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-NGram Engine + Image-Modulated Generation
+NGram Engine + Image-Modulated Generation (with USB camera capture)
 ===============================================================================
 This replaces the previous "V18-RP-ANISO-RIPPLE-SPAGHETTI-CARDAN" engine
 (hyperbolic Bolyai/Thebault token geometry + Cardan Grille Isomorphism vocab
@@ -23,6 +23,8 @@ token is deterministically mapped to a column of the image, and that
 column's average color feeds three lightweight "brush" trends (contrast,
 chromatic phase, glow) that combine into a per-token bias, exactly mirroring
 the spirit (and the three-brush structure) of the original.
+
+NEW: USB camera capture via OpenCV with a single button click.
 """
 
 from __future__ import annotations
@@ -46,6 +48,11 @@ try:
     import serial
 except Exception:  # pyserial may not be installed / no Arduino attached
     serial = None
+
+try:
+    import cv2
+except Exception:
+    cv2 = None
 
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import TruncatedSVD
@@ -980,6 +987,51 @@ def _gui_generate(prompt, n_gens, max_tokens, temp, top_k, cancel_strength,
         return f"❌ Error:\n{traceback.format_exc()}", "", ""
 
 
+def capture_usb_camera(camera_index=0, width=1280, height=720):
+    """
+    Capture one frame from a USB camera.
+
+    Returns:
+        RGB NumPy image suitable for Gradio ImageEditor/Image.
+    """
+    if cv2 is None:
+        raise RuntimeError(
+            "OpenCV is not installed. Install it with: pip install opencv-python"
+        )
+
+    camera_index = int(camera_index)
+
+    # CAP_DSHOW is useful on Windows; fall back to the default backend if needed.
+    if os.name == "nt":
+        camera = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+    else:
+        camera = cv2.VideoCapture(camera_index)
+
+    if not camera.isOpened():
+        camera.release()
+        raise RuntimeError(
+            f"Could not open camera index {camera_index}. "
+            "Try camera index 1 or 2."
+        )
+
+    camera.set(cv2.CAP_PROP_FRAME_WIDTH, int(width))
+    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
+
+    # Discard a few initial frames so exposure and focus can settle.
+    frame = None
+    for _ in range(5):
+        ok, frame = camera.read()
+
+    camera.release()
+
+    if not ok or frame is None:
+        raise RuntimeError("The camera opened, but no image frame was received.")
+
+    # OpenCV returns BGR; Gradio expects RGB.
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    return frame_rgb
+
+
 def build_gradio_app() -> gr.Blocks:
     with gr.Blocks(title="NGram Engine + Image-Modulated Generation") as demo:
         gr.Markdown("# NGram Engine")
@@ -991,7 +1043,8 @@ def build_gradio_app() -> gr.Blocks:
             "**Image modulation is preserved**: an uploaded picture — "
             "optionally scaled by a live Arduino sensor reading — still "
             "biases which tokens get chosen during generation, via "
-            "`ImagePixelModulator`."
+            "`ImagePixelModulator`.\n\n"
+            "**USB camera capture added**: click 'Capture USB Camera' to grab a frame."
         )
 
         with gr.Tab("Init / Train"):
@@ -1016,32 +1069,53 @@ def build_gradio_app() -> gr.Blocks:
                 mod_weight = gr.Slider(0.0, 2.0, value=MODIFIER_WEIGHT, step=0.05, label="Consensus modifier weight")
                 evid_weight = gr.Slider(0.0, 2.0, value=EVIDENCE_WEIGHT, step=0.05, label="Evidence weight")
                 img_weight = gr.Slider(0.0, 2.0, value=IMAGE_WEIGHT, step=0.05, label="Image modulation weight")
-           
-            gr.Markdown("### Upload Image")
+
+            gr.Markdown("### Image source")
+
             with gr.Row():
                 try:
-                    art_img = gr.ImageEditor(type="numpy", label="Modulation image", image_mode="RGB")
+                    art_img = gr.ImageEditor(
+                        type="numpy",
+                        label="Modulation image",
+                        image_mode="RGB",
+                    )
                 except AttributeError:
-                    art_img = gr.Image(tool="color-sketch", type="numpy", label="Modulation image")
-                """
+                    art_img = gr.Image(
+                        type="numpy",
+                        label="Modulation image",
+                    )
+
                 with gr.Column():
-                    gr.Markdown("**Live Arduino Stream (A0)**")
-                    live_arduino_ui = gr.Slider(0.0, 1.0, value=1.0, interactive=False,
-                                                 label="Current autonomic carrier intensity")
-                    refresh_arduino_btn = gr.Button("Refresh Sensor Value")
-                    with gr.Row():
-                        save_arduino_btn = gr.Button("Save Autonomic State")
-                        load_arduino_btn = gr.Button("Load Autonomic State")
-                    autonomic_status_out = gr.Textbox(label="Save/Load Status", interactive=False, lines=1)
-                    """
+                    camera_index = gr.Number(
+                        value=0,
+                        precision=0,
+                        label="USB camera index",
+                    )
+
+                    capture_camera_btn = gr.Button(
+                        "Capture USB Camera",
+                        variant="secondary",
+                    )
+
+                    capture_status = gr.Textbox(
+                        label="Camera status",
+                        interactive=False,
+                    )
+
+                    capture_camera_btn.click(
+                        fn=capture_usb_camera,
+                        inputs=[camera_index],
+                        outputs=[art_img],
+                    ).then(
+                        fn=lambda: "USB camera frame captured.",
+                        inputs=[],
+                        outputs=[capture_status],
+                    )
+
             gen_btn = gr.Button("Generate")
             gen_out = gr.Textbox(lines=10, label="Generated text")
             cand_out = gr.Textbox(lines=14, label="Corpus evidence / candidates")
             ens_out = gr.Textbox(lines=14, label="Ensemble (scratch runs + surviving tokens)")
-
-            #refresh_arduino_btn.click(fn=lambda: LATEST_AUTONOMIC_VAL, inputs=[], outputs=[live_arduino_ui])
-            #save_arduino_btn.click(fn=save_autonomic_ui, inputs=[], outputs=[autonomic_status_out])
-            #load_arduino_btn.click(fn=load_autonomic_ui, inputs=[], outputs=[autonomic_status_out, live_arduino_ui])
 
             gen_btn.click(
                 _gui_generate,

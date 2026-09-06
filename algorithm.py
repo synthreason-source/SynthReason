@@ -1017,7 +1017,7 @@ def build_gradio_app() -> gr.Blocks:
                 evid_weight = gr.Slider(0.0, 2.0, value=EVIDENCE_WEIGHT, step=0.05, label="Evidence weight")
                 img_weight = gr.Slider(0.0, 2.0, value=IMAGE_WEIGHT, step=0.05, label="Image modulation weight")
            
-            gr.Markdown("### Upload Image (modulates generation; scaled by the Arduino carrier below)")
+            gr.Markdown("### Upload Image")
             with gr.Row():
                 try:
                     art_img = gr.ImageEditor(type="numpy", label="Modulation image", image_mode="RGB")
